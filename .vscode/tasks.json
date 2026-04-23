@@ -1,0 +1,18 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Upload UF2 (RPI-RP2 fallback)",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-ExecutionPolicy",
+				"Bypass",
+				"-NoProfile",
+				"-Command",
+				"$d=(Get-Volume | Where-Object { $_.FileSystemLabel -eq \"RPI-RP2\" } | Select-Object -First 1 -ExpandProperty DriveLetter); if(-not $d){ throw \"RPI-RP2 drive not found. Put board in BOOTSEL mode first.\" }; $dest = \"$d`:\\\"; Copy-Item \".pio/build/kb2040/firmware.uf2\" $dest -Force; Write-Output \"Copied firmware.uf2 to $dest\""
+			],
+			"group": "build"
+		}
+	]
+}

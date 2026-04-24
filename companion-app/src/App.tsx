@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 
 type MidiType = 'NOTE' | 'CC' | 'PC' | 'TRANSPORT'
 type Behavior = 'MOMENTARY' | 'TOGGLE'
@@ -46,7 +46,22 @@ type MonitorMessage = {
   channel: number | null
 }
 
+const MONITOR_TYPES: MidiMonitorType[] = [
+  'Note On',
+  'Note Off',
+  'Control Change (CC)',
+  'Program Change',
+  'Pitch Bend',
+  'Aftertouch',
+  'System',
+  'Unknown',
+]
+
+const MONITOR_CHANNELS = Array.from({ length: 16 }, (_, i) => i + 1)
+
 const STORAGE_KEY = 'footswitch-companion-v1'
+const MIDI_OUTPUT_ID_KEY = 'footswitch-midi-output-id'
+const MIDI_CAPTURE_IDS_KEY = 'footswitch-midi-capture-ids'
 
 function buildDefaults(): AppConfig {
   const banks: BankLayout[] = []
@@ -122,6 +137,23 @@ function parseMidiMessage(data: Uint8Array): {
   channel: number | null
 } {
   const status = data[0] ?? 0
+
+  if (
+    status === 0xf0 &&
+    data.length >= 9 &&
+    data[1] === 0x7d &&
+    data[2] === 0x46 &&
+    data[3] === 0x53 &&
+    data[4] === 0x57 &&
+    data[5] === 0x13
+  ) {
+    return {
+      type: 'System',
+      detail: `Pico firmware v${data[6]}.${data[7]}.${data[8]}`,
+      channel: null,
+    }
+  }
+
   const high = status & 0xf0
   const channel = (status & 0x0f) + 1
   const d1 = data[1] ?? 0
@@ -198,6 +230,26 @@ function parseMidiMessage(data: Uint8Array): {
   }
 }
 
+function pickPreferredOutputId(outputs: MIDIOutput[]): string {
+  if (outputs.length === 0) return ''
+
+  const preferred = outputs.find((out) => {
+    const name = (out.name ?? '').toLowerCase()
+    return (
+      name.includes('pico') ||
+      name.includes('kb2040') ||
+      name.includes('footswitch')
+    )
+  })
+
+  return preferred?.id ?? outputs[0].id
+}
+
+function isLikelyFootswitchOutputName(name: string): boolean {
+  const n = name.toLowerCase()
+  return n.includes('pico') || n.includes('kb2040') || n.includes('footswitch')
+}
+
 function App() {
   const [page, setPage] = useState<AppPage>('editor')
   const [config, setConfig] = useState<AppConfig>(() => {
@@ -218,17 +270,29 @@ function App() {
   const [selectedOutputId, setSelectedOutputId] = useState('')
   const [transferStatus, setTransferStatus] = useState('Not connected')
   const [monitorRunning, setMonitorRunning] = useState(true)
+  const [deduplicateEnabled, setDeduplicateEnabled] = useState(true)
   const [messages, setMessages] = useState<MonitorMessage[]>([])
-  const [selectedMonitorInputId, setSelectedMonitorInputId] = useState('ALL')
-  const [deviceFilter, setDeviceFilter] = useState('ALL')
-  const [typeFilter, setTypeFilter] = useState<MidiMonitorType | 'ALL'>('ALL')
-  const [channelFilter, setChannelFilter] = useState<number | 'ALL'>('ALL')
+  const [selectedCaptureInputIds, setSelectedCaptureInputIds] = useState<string[]>([])
+  const [selectedDeviceFilters, setSelectedDeviceFilters] = useState<string[]>([])
+  const [selectedTypeFilters, setSelectedTypeFilters] = useState<MidiMonitorType[]>(MONITOR_TYPES)
+  const [selectedChannelFilters, setSelectedChannelFilters] = useState<number[]>(MONITOR_CHANNELS)
   const messageIdRef = useRef(1)
   const monitorRunningRef = useRef(monitorRunning)
-  const selectedMonitorInputIdRef = useRef(selectedMonitorInputId)
+  const selectedCaptureInputIdsRef = useRef<string[]>([])
+  const deduplicateEnabledRef = useRef(deduplicateEnabled)
+  const lastEventSeenRef = useRef<Map<string, number>>(new Map())
 
   monitorRunningRef.current = monitorRunning
-  selectedMonitorInputIdRef.current = selectedMonitorInputId
+  selectedCaptureInputIdsRef.current = selectedCaptureInputIds
+  deduplicateEnabledRef.current = deduplicateEnabled
+
+  useEffect(() => {
+    localStorage.setItem(MIDI_OUTPUT_ID_KEY, selectedOutputId)
+  }, [selectedOutputId])
+
+  useEffect(() => {
+    localStorage.setItem(MIDI_CAPTURE_IDS_KEY, JSON.stringify(selectedCaptureInputIds))
+  }, [selectedCaptureInputIds])
 
   const activeBank = useMemo(
     () => config.banks.find((b) => b.bank === selectedBank) ?? config.banks[0],
@@ -237,12 +301,15 @@ function App() {
 
   const visibleMessages = useMemo(() => {
     return messages.filter((msg) => {
-      if (deviceFilter !== 'ALL' && msg.device !== deviceFilter) return false
-      if (typeFilter !== 'ALL' && msg.type !== typeFilter) return false
-      if (channelFilter !== 'ALL' && msg.channel !== channelFilter) return false
+      if (!selectedDeviceFilters.includes(msg.device)) return false
+      if (!selectedTypeFilters.includes(msg.type)) return false
+
+      // Channel filtering applies to channelized MIDI messages only.
+      if (msg.channel !== null && !selectedChannelFilters.includes(msg.channel)) return false
+
       return true
     })
-  }, [messages, deviceFilter, typeFilter, channelFilter])
+  }, [messages, selectedDeviceFilters, selectedTypeFilters, selectedChannelFilters])
 
   const activeDevices = useMemo(() => {
     const devices = new Set(messages.map((m) => m.device))
@@ -316,20 +383,47 @@ function App() {
       const access = await navigator.requestMIDIAccess({ sysex: true })
       const outputs = Array.from(access.outputs.values())
       const inputs = Array.from(access.inputs.values())
+      const savedOutputId = localStorage.getItem(MIDI_OUTPUT_ID_KEY) ?? ''
+      const savedCaptureIdsRaw = localStorage.getItem(MIDI_CAPTURE_IDS_KEY)
+      let savedCaptureIds: string[] = []
+      if (savedCaptureIdsRaw) {
+        try {
+          const parsed = JSON.parse(savedCaptureIdsRaw) as string[]
+          if (Array.isArray(parsed)) {
+            savedCaptureIds = parsed
+          }
+        } catch {
+          savedCaptureIds = []
+        }
+      }
+
       setMidiAccess(access)
       setMidiOutputs(outputs)
       setMidiInputs(inputs)
-      if (inputs.length > 0) {
-        setSelectedMonitorInputId(inputs[0].id)
+
+      const chosenOutputId =
+        (savedOutputId && outputs.some((o) => o.id === savedOutputId))
+          ? savedOutputId
+          : pickPreferredOutputId(outputs)
+      setSelectedOutputId(chosenOutputId)
+
+      const validSavedCaptureIds = savedCaptureIds.filter((id) => inputs.some((i) => i.id === id))
+      if (validSavedCaptureIds.length > 0) {
+        setSelectedCaptureInputIds(validSavedCaptureIds)
+      } else {
+        setSelectedCaptureInputIds(inputs.map((i) => i.id))
       }
+
+      const deviceNames = inputs.map((i) => i.name ?? i.id)
+      setSelectedDeviceFilters(deviceNames)
 
       const bindInputs = () => {
         access.inputs.forEach((input) => {
           input.onmidimessage = (event) => {
             if (!monitorRunningRef.current) return
             if (
-              selectedMonitorInputIdRef.current !== 'ALL' &&
-              input.id !== selectedMonitorInputIdRef.current
+              selectedCaptureInputIdsRef.current.length > 0 &&
+              !selectedCaptureInputIdsRef.current.includes(input.id)
             ) {
               return
             }
@@ -344,15 +438,28 @@ function App() {
               .join(' ')
             const parsed = parseMidiMessage(event.data)
 
+            const deviceName = input.name ?? input.id
+
+            const dedupeKey = `${deviceName}|${rawHex}|${parsed.type}|${parsed.channel ?? 'NA'}`
+            const nowMs = Date.now()
+            if (deduplicateEnabledRef.current) {
+              const lastMs = lastEventSeenRef.current.get(dedupeKey)
+              if (typeof lastMs === 'number' && nowMs - lastMs <= 8) {
+                return
+              }
+            }
+            lastEventSeenRef.current.set(dedupeKey, nowMs)
+
             const row: MonitorMessage = {
               id: messageIdRef.current++,
               timestamp: new Date().toLocaleTimeString('en-GB', {
                 hour12: false,
+                hour: '2-digit',
                 minute: '2-digit',
                 second: '2-digit',
                 fractionalSecondDigits: 3,
               }),
-              device: input.name ?? 'Unknown MIDI Input',
+              device: deviceName,
               type: parsed.type,
               rawHex,
               detail: parsed.detail,
@@ -366,13 +473,39 @@ function App() {
 
       bindInputs()
       access.onstatechange = () => {
-        setMidiOutputs(Array.from(access.outputs.values()))
-        setMidiInputs(Array.from(access.inputs.values()))
+        const nextOutputs = Array.from(access.outputs.values())
+        const nextInputs = Array.from(access.inputs.values())
+
+        setMidiOutputs(nextOutputs)
+        setMidiInputs(nextInputs)
+
+        setSelectedOutputId((current) => {
+          if (current && nextOutputs.some((o) => o.id === current)) return current
+          return nextOutputs[0]?.id ?? ''
+        })
+
+        setSelectedCaptureInputIds((current) => {
+          const nextIds = nextInputs.map((i) => i.id)
+          const kept = current.filter((id) => nextIds.includes(id))
+          if (kept.length > 0) return kept
+          return nextIds
+        })
+
+        setSelectedDeviceFilters((current) => {
+          const names = nextInputs.map((i) => i.name ?? i.id)
+          const kept = current.filter((name) => names.includes(name))
+          if (kept.length > 0) return kept
+          return names
+        })
+
         bindInputs()
       }
 
       if (outputs.length > 0) {
-        setSelectedOutputId(outputs[0].id)
+        setSelectedOutputId((current) => {
+          if (current && outputs.some((o) => o.id === current)) return current
+          return pickPreferredOutputId(outputs)
+        })
         setTransferStatus(`Connected: ${outputs.length} output(s), ${inputs.length} input(s)`)
       } else {
         setTransferStatus(`Connected: 0 output(s), ${inputs.length} input(s)`)
@@ -382,8 +515,66 @@ function App() {
     }
   }
 
+  useEffect(() => {
+    if (!('requestMIDIAccess' in navigator)) {
+      return
+    }
+
+    // Try reconnect on app load. If permissions are unavailable, user can still use Connect MIDI.
+    void connectMidi()
+  }, [])
+
   const sendSysex = (output: MIDIOutput, payload: number[]) => {
     output.send([0xf0, 0x7d, 0x46, 0x53, 0x57, ...payload, 0xf7])
+  }
+
+  const checkPicoFirmware = () => {
+    if (!midiAccess) {
+      setTransferStatus('Connect MIDI first.')
+      return
+    }
+
+    const output = midiAccess.outputs.get(selectedOutputId)
+    if (!output) {
+      setTransferStatus('Select a valid MIDI output device.')
+      return
+    }
+
+    sendSysex(output, [0x13])
+    setTransferStatus(`Sent firmware probe to ${output.name ?? 'MIDI device'}`)
+  }
+
+  const deviceFilterOptions = useMemo(
+    () => Array.from(new Set(midiInputs.map((input) => input.name ?? input.id))),
+    [midiInputs],
+  )
+
+  const toggleStringSelection = (
+    value: string,
+    selected: string[],
+    setSelected: (next: string[]) => void,
+  ) => {
+    if (selected.includes(value)) {
+      setSelected(selected.filter((v) => v !== value))
+    } else {
+      setSelected([...selected, value])
+    }
+  }
+
+  const toggleTypeSelection = (value: MidiMonitorType) => {
+    if (selectedTypeFilters.includes(value)) {
+      setSelectedTypeFilters(selectedTypeFilters.filter((v) => v !== value))
+    } else {
+      setSelectedTypeFilters([...selectedTypeFilters, value])
+    }
+  }
+
+  const toggleChannelSelection = (value: number) => {
+    if (selectedChannelFilters.includes(value)) {
+      setSelectedChannelFilters(selectedChannelFilters.filter((v) => v !== value))
+    } else {
+      setSelectedChannelFilters([...selectedChannelFilters, value])
+    }
   }
 
   const sendToFootswitch = () => {
@@ -392,7 +583,30 @@ function App() {
       return
     }
 
-    const output = midiAccess.outputs.get(selectedOutputId)
+    const allOutputs = Array.from(midiAccess.outputs.values())
+    if (allOutputs.length === 0) {
+      setTransferStatus('No MIDI outputs available.')
+      return
+    }
+
+    const selectedOutput = midiAccess.outputs.get(selectedOutputId)
+    const preferredOutputId = pickPreferredOutputId(allOutputs)
+    const preferredOutput = midiAccess.outputs.get(preferredOutputId)
+
+    // If a non-footswitch output is currently selected and a likely footswitch output exists,
+    // route transfer to the footswitch output automatically.
+    let output = selectedOutput ?? preferredOutput
+    if (
+      selectedOutput &&
+      preferredOutput &&
+      selectedOutput.id !== preferredOutput.id &&
+      !isLikelyFootswitchOutputName(selectedOutput.name ?? '') &&
+      isLikelyFootswitchOutputName(preferredOutput.name ?? '')
+    ) {
+      output = preferredOutput
+      setSelectedOutputId(preferredOutput.id)
+    }
+
     if (!output) {
       setTransferStatus('Select a valid MIDI output device.')
       return
@@ -433,8 +647,11 @@ function App() {
         <div className="actions">
           <button onClick={() => setConfig(buildDefaults())}>Factory Defaults</button>
           <button onClick={exportConfig}>Export JSON</button>
-          <button onClick={connectMidi}>Connect MIDI</button>
+          <button onClick={connectMidi}>
+            {midiAccess ? 'Refresh MIDI' : 'Connect MIDI'}
+          </button>
           <button onClick={sendToFootswitch}>Send to Footswitch</button>
+          <button onClick={checkPicoFirmware}>Check Pico Firmware</button>
           <label className="filePick">
             Import JSON
             <input
@@ -623,100 +840,142 @@ function App() {
               {monitorRunning ? 'Pause Monitor' : 'Resume Monitor'}
             </button>
             <button onClick={() => setMessages([])}>Clear Log</button>
-
             <label>
-              Capture Input
-              <select
-                value={selectedMonitorInputId}
-                onChange={(e) => setSelectedMonitorInputId(e.target.value)}
-              >
-                <option value="ALL">All inputs</option>
-                {midiInputs.map((input) => (
-                  <option key={input.id} value={input.id}>
-                    {input.name ?? input.id}
-                  </option>
-                ))}
-              </select>
-            </label>
-
-            <label>
-              Logged Device Filter
-              <select value={deviceFilter} onChange={(e) => setDeviceFilter(e.target.value)}>
-                <option value="ALL">All devices</option>
-                {midiInputs.map((input) => {
-                  const name = input.name ?? input.id
-                  return (
-                    <option key={input.id} value={name}>
-                      {name}
-                    </option>
-                  )
-                })}
-              </select>
-            </label>
-
-            <label>
-              Message Types
-              <select
-                value={typeFilter}
-                onChange={(e) => setTypeFilter(e.target.value as MidiMonitorType | 'ALL')}
-              >
-                <option value="ALL">All types</option>
-                <option value="Note On">Note On</option>
-                <option value="Note Off">Note Off</option>
-                <option value="Control Change (CC)">Control Change (CC)</option>
-                <option value="Program Change">Program Change</option>
-                <option value="Pitch Bend">Pitch Bend</option>
-                <option value="Aftertouch">Aftertouch</option>
-                <option value="System">System</option>
-                <option value="Unknown">Unknown</option>
-              </select>
-            </label>
-
-            <label>
-              MIDI Channels
-              <select
-                value={String(channelFilter)}
-                onChange={(e) => {
-                  const next = e.target.value
-                  setChannelFilter(next === 'ALL' ? 'ALL' : Number(next))
-                }}
-              >
-                <option value="ALL">All channels</option>
-                {Array.from({ length: 16 }, (_, i) => i + 1).map((ch) => (
-                  <option key={ch} value={ch}>
-                    Ch {ch}
-                  </option>
-                ))}
-              </select>
+              <input
+                type="checkbox"
+                checked={deduplicateEnabled}
+                onChange={(e) => setDeduplicateEnabled(e.target.checked)}
+              />
+              Deduplicate mirrored events
             </label>
           </section>
 
-          <section className="monitorTableWrap">
-            <table className="monitorTable">
-              <thead>
-                <tr>
-                  <th>Timestamp</th>
-                  <th>Device</th>
-                  <th>Type</th>
-                  <th>Data</th>
-                  <th>Channel</th>
-                </tr>
-              </thead>
-              <tbody>
-                {visibleMessages.map((msg) => (
-                  <tr key={msg.id}>
-                    <td>{msg.timestamp}</td>
-                    <td>{msg.device}</td>
-                    <td>{msg.type}</td>
-                    <td>
-                      <span className="hex">{msg.rawHex}</span>
-                      <span>{msg.detail}</span>
-                    </td>
-                    <td>{msg.channel ?? '-'}</td>
+          <section className="monitorLayout">
+            <aside className="monitorSidebar">
+              <div className="filterGroup">
+                <div className="filterHeader">
+                  <h3>Capture Inputs</h3>
+                  <div className="filterButtons">
+                    <button onClick={() => setSelectedCaptureInputIds(midiInputs.map((i) => i.id))}>All</button>
+                    <button onClick={() => setSelectedCaptureInputIds([])}>None</button>
+                  </div>
+                </div>
+                <div className="checkList">
+                  {midiInputs.map((input) => (
+                    <label key={input.id} className="checkItem">
+                      <input
+                        type="checkbox"
+                        checked={selectedCaptureInputIds.includes(input.id)}
+                        onChange={() =>
+                          toggleStringSelection(
+                            input.id,
+                            selectedCaptureInputIds,
+                            setSelectedCaptureInputIds,
+                          )
+                        }
+                      />
+                      <span>{input.name ?? input.id}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+
+              <div className="filterGroup">
+                <div className="filterHeader">
+                  <h3>Device Filter</h3>
+                  <div className="filterButtons">
+                    <button onClick={() => setSelectedDeviceFilters(deviceFilterOptions)}>All</button>
+                    <button onClick={() => setSelectedDeviceFilters([])}>None</button>
+                  </div>
+                </div>
+                <div className="checkList">
+                  {deviceFilterOptions.map((name) => (
+                    <label key={name} className="checkItem">
+                      <input
+                        type="checkbox"
+                        checked={selectedDeviceFilters.includes(name)}
+                        onChange={() =>
+                          toggleStringSelection(name, selectedDeviceFilters, setSelectedDeviceFilters)
+                        }
+                      />
+                      <span>{name}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+
+              <div className="filterGroup">
+                <div className="filterHeader">
+                  <h3>Message Types</h3>
+                  <div className="filterButtons">
+                    <button onClick={() => setSelectedTypeFilters(MONITOR_TYPES)}>All</button>
+                    <button onClick={() => setSelectedTypeFilters([])}>None</button>
+                  </div>
+                </div>
+                <div className="checkList">
+                  {MONITOR_TYPES.map((type) => (
+                    <label key={type} className="checkItem">
+                      <input
+                        type="checkbox"
+                        checked={selectedTypeFilters.includes(type)}
+                        onChange={() => toggleTypeSelection(type)}
+                      />
+                      <span>{type}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+
+              <div className="filterGroup">
+                <div className="filterHeader">
+                  <h3>MIDI Channels</h3>
+                  <div className="filterButtons">
+                    <button onClick={() => setSelectedChannelFilters(MONITOR_CHANNELS)}>All</button>
+                    <button onClick={() => setSelectedChannelFilters([])}>None</button>
+                  </div>
+                </div>
+                <div className="checkList checkListCompact">
+                  {MONITOR_CHANNELS.map((ch) => (
+                    <label key={ch} className="checkItem">
+                      <input
+                        type="checkbox"
+                        checked={selectedChannelFilters.includes(ch)}
+                        onChange={() => toggleChannelSelection(ch)}
+                      />
+                      <span>Ch {ch}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+            </aside>
+
+            <section className="monitorTableWrap">
+              <table className="monitorTable">
+                <thead>
+                  <tr>
+                    <th>Timestamp</th>
+                    <th>Device</th>
+                    <th>Type</th>
+                    <th>Data</th>
+                    <th>Channel</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {visibleMessages.map((msg) => (
+                    <tr key={msg.id}>
+                      <td>{msg.timestamp}</td>
+                      <td>{msg.device}</td>
+                      <td>{msg.type}</td>
+                      <td>
+                        <span className="hex">{msg.rawHex}</span>
+                        <span>{msg.detail}</span>
+                      </td>
+                      <td>{msg.channel ?? '-'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </section>
           </section>
         </>
       )}

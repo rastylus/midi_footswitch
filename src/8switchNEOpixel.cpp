@@ -208,6 +208,10 @@ const unsigned long transferMsgDurationMs = 1200;
 unsigned long transferErrMsgUntilMs = 0;
 const unsigned long transferErrMsgDurationMs = 1400;
 
+const uint8_t FW_VERSION_MAJOR = 0;
+const uint8_t FW_VERSION_MINOR = 4;
+const uint8_t FW_VERSION_PATCH = 0;
+
 // Editor state
 EditState editState = EDIT_NAVIGATE;
 ScreenMode currentScreen = SCREEN_EDIT_PRIMARY;
@@ -273,6 +277,7 @@ void processIncomingUsbMidi();
 void processSysexByte(uint8_t b);
 void handleSysexMessage(const uint8_t* data, uint8_t len);
 void showTransferError();
+void sendUsbSysexPayload(const uint8_t* payload, uint8_t len);
 void sendNoteOnBoth(uint8_t note, uint8_t velocity, uint8_t channel);
 void sendNoteOffBoth(uint8_t note, uint8_t velocity, uint8_t channel);
 void sendCcBoth(uint8_t ccNumber, uint8_t value, uint8_t channel);
@@ -616,7 +621,58 @@ void handleSysexMessage(const uint8_t* data, uint8_t len) {
     return;
   }
 
+  // Firmware probe reply for companion app diagnostics.
+  if (cmd == 0x13) {
+    uint8_t reply[] = {0x7D, 'F', 'S', 'W', 0x13, FW_VERSION_MAJOR, FW_VERSION_MINOR, FW_VERSION_PATCH};
+    sendUsbSysexPayload(reply, (uint8_t)sizeof(reply));
+    return;
+  }
+
   showTransferError();
+}
+
+void sendUsbSysexPayload(const uint8_t* payload, uint8_t len) {
+  if (len == 0) return;
+
+  uint8_t buf[34];
+  if (len + 2 > sizeof(buf)) return;
+
+  buf[0] = 0xF0;
+  for (uint8_t i = 0; i < len; i++) {
+    buf[i + 1] = payload[i];
+  }
+  buf[len + 1] = 0xF7;
+
+  uint8_t total = (uint8_t)(len + 2);
+  uint8_t idx = 0;
+  while (idx < total) {
+    uint8_t remaining = (uint8_t)(total - idx);
+    midiEventPacket_t packet;
+
+    if (remaining >= 3) {
+      packet.header = (remaining == 3) ? 0x7 : 0x4;
+      packet.byte1 = buf[idx];
+      packet.byte2 = buf[idx + 1];
+      packet.byte3 = buf[idx + 2];
+      idx += 3;
+    } else if (remaining == 2) {
+      packet.header = 0x6;
+      packet.byte1 = buf[idx];
+      packet.byte2 = buf[idx + 1];
+      packet.byte3 = 0x00;
+      idx += 2;
+    } else {
+      packet.header = 0x5;
+      packet.byte1 = buf[idx];
+      packet.byte2 = 0x00;
+      packet.byte3 = 0x00;
+      idx += 1;
+    }
+
+    MidiUSB.sendMIDI(packet);
+  }
+
+  MidiUSB.flush();
 }
 
 // ============================================================
@@ -1370,17 +1426,21 @@ void updateStatusPixels() {
 // ============================================================
 
 void sendMidiOn(const SwitchConfig &sw) {
+  uint8_t outChannel = (sw.channel >= 1 && sw.channel <= 16)
+    ? sw.channel
+    : (uint8_t)globalMidiChannel;
+
   switch (sw.midiType) {
     case MIDI_NOTE:
-      sendNoteOnBoth(sw.number, sw.onValue, globalMidiChannel);
+      sendNoteOnBoth(sw.number, sw.onValue, outChannel);
       break;
 
     case MIDI_CC:
-      sendCcBoth(sw.number, sw.onValue, globalMidiChannel);
+      sendCcBoth(sw.number, sw.onValue, outChannel);
       break;
 
     case MIDI_PC:
-      sendProgramChangeBoth(sw.number, globalMidiChannel);
+      sendProgramChangeBoth(sw.number, outChannel);
       break;
 
     case MIDI_TRANSPORT:
@@ -1390,13 +1450,17 @@ void sendMidiOn(const SwitchConfig &sw) {
 }
 
 void sendMidiOff(const SwitchConfig &sw) {
+  uint8_t outChannel = (sw.channel >= 1 && sw.channel <= 16)
+    ? sw.channel
+    : (uint8_t)globalMidiChannel;
+
   switch (sw.midiType) {
     case MIDI_NOTE:
-      sendNoteOffBoth(sw.number, sw.offValue, globalMidiChannel);
+      sendNoteOffBoth(sw.number, sw.offValue, outChannel);
       break;
 
     case MIDI_CC:
-      sendCcBoth(sw.number, sw.offValue, globalMidiChannel);
+      sendCcBoth(sw.number, sw.offValue, outChannel);
       break;
 
     case MIDI_PC:

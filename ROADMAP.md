@@ -9,8 +9,11 @@
 - [x] Single-chain status LEDs (power + bank)
 - [x] Encoder-driven settings UI (bank, type, number, channel, behavior)
 - [x] Bank switching with multi-bank mappings
+- [x] Chord bank switching (SW1+SW2 down, SW7+SW8 up)
 - [x] EEPROM settings memory with restore on boot
 - [x] Cascade bank preset layout + reset action
+- [x] Transport command type (PLAY/STOP/CONT/PANIC) + dedicated transport bank
+- [x] Ableton-first factory-reset default mapping profile
 - [x] Adjustable NeoPixel brightness from UI
 - [x] Git repository initialized and pushed
 
@@ -21,6 +24,7 @@
 - [x] Define bank-switch controls (encoder UI)
 - [x] Persist current bank in RAM runtime state
 - [x] Update OLED and bank status LED on bank change
+- [x] Add footswitch chord shortcuts for bank up/down
 
 ### 2) Config Organization
 - [ ] Move switch config data to dedicated module/header
@@ -40,7 +44,7 @@
 
 ### 5) MIDI Features
 - [ ] Long-press / double-tap actions
-- [ ] Optional MIDI clock/start/stop controls
+- [x] Optional MIDI clock/start/stop controls
 - [ ] Optional expression pedal support
 
 ### 6) Reliability

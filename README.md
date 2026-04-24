@@ -4,11 +4,28 @@ Custom RP2040 MIDI footswitch firmware built with PlatformIO for Adafruit KB2040
 
 Current capabilities:
 - 8 footswitch inputs with debounce
-- Per-switch MIDI action types: Note, CC, Program Change
+- Per-switch MIDI action types: Note, CC, Program Change, Transport
 - Momentary and toggle behaviors
 - USB MIDI + DIN MIDI output
 - OLED status display (SSD1306 128x64, I2C)
 - NeoPixel switch LEDs + 2 status LEDs on same chain
+- Chord bank switching (SW1+SW2 down, SW7+SW8 up)
+
+## Default Switch Mapping (Factory Reset)
+
+Factory reset applies an Ableton-first profile:
+
+- Bank 1 (control bank): all 8 switches are toggle CC messages on channel 1.
+  - SW1-SW8 send CC20-CC27, ON=127 and OFF=0.
+- Banks 2-7 (clip launch): all 8 switches are momentary notes on channel 1.
+  - Bank 2 starts at notes 60-67.
+  - Each next bank adds +8 to each note number.
+- Bank 8 (transport): fixed mirrored transport layout.
+  - SW1..SW8 = PLAY, STOP, CONT, PANIC, PANIC, CONT, STOP, PLAY.
+
+Notes:
+- Existing saved EEPROM settings load at boot and override factory defaults.
+- To re-apply this mapping, use the on-device reset-hold action (CASCADE RESET).
 
 ## Hardware
 

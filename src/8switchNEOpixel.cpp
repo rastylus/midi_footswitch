@@ -278,7 +278,9 @@ const char* screenModeName(ScreenMode mode);
 const EditField* currentNavigationOrder(int &count);
 const char* midiTypeName(MidiActionType type);
 const char* transportName(uint8_t commandIndex);
+const char* noteName(uint8_t note);
 const char* behaviorName(SwitchBehavior behavior);
+RgbColor typeOnColor(MidiActionType type);
 SwitchConfig& activeSwitch(int index);
 void buildCascadeBankPresets();
 void applyCascadeFactoryReset();
@@ -499,17 +501,18 @@ void handlePress(int index) {
   }
 
   SwitchConfig &sw = activeSwitch(index);
+  RgbColor onColor = typeOnColor(sw.midiType);
 
   if (sw.behavior == BEHAVIOR_MOMENTARY) {
     sendMidiOn(sw);
-    setPixel(index, sw.onColor);
+    setPixel(index, onColor);
     updateDisplay(index, sw, true);
   } else if (sw.behavior == BEHAVIOR_TOGGLE) {
     toggleState[index] = !toggleState[index];
 
     if (toggleState[index]) {
       sendMidiOn(sw);
-      setPixel(index, sw.onColor);
+      setPixel(index, onColor);
     } else {
       sendMidiOff(sw);
       setPixel(index, sw.offColor);
@@ -627,11 +630,32 @@ const char* transportName(uint8_t commandIndex) {
   }
 }
 
+const char* noteName(uint8_t note) {
+  static char buf[6];
+  static const char* names[12] = {
+    "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"
+  };
+
+  int octave = ((int)note / 12) - 1;
+  snprintf(buf, sizeof(buf), "%s%d", names[note % 12], octave);
+  return buf;
+}
+
 const char* behaviorName(SwitchBehavior behavior) {
   switch (behavior) {
     case BEHAVIOR_MOMENTARY: return "MOMENTARY";
     case BEHAVIOR_TOGGLE:    return "TOGGLE";
     default:                 return "?";
+  }
+}
+
+RgbColor typeOnColor(MidiActionType type) {
+  switch (type) {
+    case MIDI_NOTE:      return {0, 50, 0};   // Green
+    case MIDI_CC:        return {0, 0, 50};   // Blue
+    case MIDI_PC:        return {50, 25, 0};  // Amber
+    case MIDI_TRANSPORT: return {50, 0, 50};  // Magenta
+    default:             return {40, 40, 40}; // White-ish fallback
   }
 }
 
@@ -702,22 +726,41 @@ void applyPixelBrightness() {
 }
 
 void buildCascadeBankPresets() {
-  // Each bank starts from defaults, then cascades MIDI numbers by 8 per bank.
+  // Start from default pin/channel/value/color fields.
   for (int bank = 0; bank < NUM_BANKS; bank++) {
-    int offset = bank * numSwitches;
     for (int i = 0; i < numSwitches; i++) {
       bankSwitches[bank][i] = defaultSwitches[i];
-
-      int shifted = (int)defaultSwitches[i].number + offset;
-      while (shifted > 127) {
-        shifted -= 128;
-      }
-      bankSwitches[bank][i].number = (uint8_t)shifted;
     }
   }
 
-  // Reserve the last bank as a transport bank:
-  // PLAY, STOP, CONT, PANIC, PANIC, CONT, STOP, PLAY.
+  // Bank 1: Ableton control bank (arming/record style controls), all toggle CC.
+  // CC layout 20..27 keeps setup simple for MIDI mapping in Live.
+  const int controlBank = 0;
+  for (int i = 0; i < numSwitches; i++) {
+    bankSwitches[controlBank][i].midiType = MIDI_CC;
+    bankSwitches[controlBank][i].behavior = BEHAVIOR_TOGGLE;
+    bankSwitches[controlBank][i].number = (uint8_t)(20 + i);
+    bankSwitches[controlBank][i].onValue = 127;
+    bankSwitches[controlBank][i].offValue = 0;
+  }
+
+  // Banks 2-7: clip-launch banks, all momentary notes with +8 offset per bank.
+  for (int bank = 1; bank < NUM_BANKS - 1; bank++) {
+    int offset = (bank - 1) * numSwitches;
+    for (int i = 0; i < numSwitches; i++) {
+      int shifted = 60 + i + offset; // Bank 2 starts at C4..G4
+      while (shifted > 127) {
+        shifted -= 128;
+      }
+      bankSwitches[bank][i].midiType = MIDI_NOTE;
+      bankSwitches[bank][i].behavior = BEHAVIOR_MOMENTARY;
+      bankSwitches[bank][i].number = (uint8_t)shifted;
+      bankSwitches[bank][i].onValue = 127;
+      bankSwitches[bank][i].offValue = 0;
+    }
+  }
+
+  // Bank 8: transport bank (PLAY, STOP, CONT, PANIC, PANIC, CONT, STOP, PLAY).
   int transportBank = NUM_BANKS - 1;
   const uint8_t transportLayout[numSwitches] = {0, 1, 2, 3, 3, 2, 1, 0};
   for (int i = 0; i < numSwitches; i++) {
@@ -931,6 +974,12 @@ void redrawDisplay() {
     } else {
       drawField(72, 32, "NUM:", selectedSw.number, selectedField == FIELD_NUMBER, editing);
     }
+
+    if (selectedSw.midiType == MIDI_NOTE) {
+      display.setCursor(0, 48);
+      display.print("NOTE:");
+      display.print(noteName(selectedSw.number));
+    }
   } else if (currentScreen == SCREEN_EDIT_SECONDARY) {
     drawField(0, 16, "SW:", selectedSwitch + 1, selectedField == FIELD_SWITCH, editing);
     drawField(30, 16, "SCH:", selectedSw.channel, selectedField == FIELD_SWITCH_CHANNEL, editing);
@@ -947,6 +996,10 @@ void redrawDisplay() {
     } else {
       display.print("  NUM:");
       display.print(selectedSw.number);
+      if (selectedSw.midiType == MIDI_NOTE) {
+        display.print(" ");
+        display.print(noteName(selectedSw.number));
+      }
     }
   } else {
     int shownSwitch = (lastPressedSwitch >= 0) ? (lastPressedSwitch + 1) : (selectedSwitch + 1);
@@ -974,6 +1027,10 @@ void redrawDisplay() {
     } else {
       display.print("NUM ");
       display.print(shownNumber);
+      if (shownType == MIDI_NOTE) {
+        display.print(" ");
+        display.print(noteName((uint8_t)shownNumber));
+      }
     }
   }
 

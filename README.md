@@ -18,8 +18,12 @@ Factory reset applies an Ableton-first profile:
 - Bank 1 (control bank): all 8 switches are toggle CC messages on channel 1.
   - SW1-SW8 send CC20-CC27, ON=127 and OFF=0.
 - Banks 2-7 (clip launch): all 8 switches are momentary notes on channel 1.
-  - Bank 2 starts at notes 60-67.
-  - Each next bank adds +8 to each note number.
+  - Bank 2: 60-67 (C4-G4)
+  - Bank 3: 68-75 (G#4-D#5)
+  - Bank 4: 76-83 (E5-B5)
+  - Bank 5: 84-91 (C6-G6)
+  - Bank 6: 92-99 (G#6-D#7)
+  - Bank 7: 100-107 (E7-B7)
 - Bank 8 (transport): fixed mirrored transport layout.
   - SW1..SW8 = PLAY, STOP, CONT, PANIC, PANIC, CONT, STOP, PLAY.
 

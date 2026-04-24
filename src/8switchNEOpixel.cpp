@@ -203,6 +203,10 @@ const int resetTextY = 48;
 
 unsigned long resetMsgUntilMs = 0;
 const unsigned long resetMsgDurationMs = 900;
+unsigned long transferMsgUntilMs = 0;
+const unsigned long transferMsgDurationMs = 1200;
+unsigned long transferErrMsgUntilMs = 0;
+const unsigned long transferErrMsgDurationMs = 1400;
 
 // Editor state
 EditState editState = EDIT_NAVIGATE;
@@ -220,6 +224,10 @@ bool lastPressedIsOn = false;
 bool configDirty = false;
 unsigned long lastConfigChangeMs = 0;
 const unsigned long configSaveDelayMs = 1500;
+
+bool sysexInProgress = false;
+uint8_t sysexBuffer[80];
+uint8_t sysexLen = 0;
 
 const EditField primaryNavigationOrder[] = {
   FIELD_SCREEN,
@@ -261,6 +269,10 @@ void setPixel(int index, const RgbColor &color);
 void updateDisplay(int index, const SwitchConfig &sw, bool isOn);
 void sendMidiOn(const SwitchConfig &sw);
 void sendMidiOff(const SwitchConfig &sw);
+void processIncomingUsbMidi();
+void processSysexByte(uint8_t b);
+void handleSysexMessage(const uint8_t* data, uint8_t len);
+void showTransferError();
 void sendNoteOnBoth(uint8_t note, uint8_t velocity, uint8_t channel);
 void sendNoteOffBoth(uint8_t note, uint8_t velocity, uint8_t channel);
 void sendCcBoth(uint8_t ccNumber, uint8_t value, uint8_t channel);
@@ -356,6 +368,8 @@ void setup() {
 // ============================================================
 
 void loop() {
+  processIncomingUsbMidi();
+
   // --- Encoder rotation ---
   if (encoderDelta != 0) {
     noInterrupts();
@@ -456,6 +470,153 @@ void loop() {
       }
     }
   }
+}
+
+void processIncomingUsbMidi() {
+  while (true) {
+    midiEventPacket_t rx = MidiUSB.read();
+    if (rx.header == 0) {
+      break;
+    }
+
+    // USB MIDI CIN values for SysEx messages.
+    if (rx.header == 0x4) {
+      processSysexByte(rx.byte1);
+      processSysexByte(rx.byte2);
+      processSysexByte(rx.byte3);
+    } else if (rx.header == 0x5) {
+      processSysexByte(rx.byte1);
+    } else if (rx.header == 0x6) {
+      processSysexByte(rx.byte1);
+      processSysexByte(rx.byte2);
+    } else if (rx.header == 0x7) {
+      processSysexByte(rx.byte1);
+      processSysexByte(rx.byte2);
+      processSysexByte(rx.byte3);
+    }
+  }
+}
+
+void processSysexByte(uint8_t b) {
+  if (b == 0xF0) {
+    sysexInProgress = true;
+    sysexLen = 0;
+    return;
+  }
+
+  if (!sysexInProgress) {
+    return;
+  }
+
+  if (b == 0xF7) {
+    handleSysexMessage(sysexBuffer, sysexLen);
+    sysexInProgress = false;
+    sysexLen = 0;
+    return;
+  }
+
+  if (sysexLen < sizeof(sysexBuffer)) {
+    sysexBuffer[sysexLen++] = b;
+  }
+}
+
+void showTransferError() {
+  transferErrMsgUntilMs = millis() + transferErrMsgDurationMs;
+  redrawDisplay();
+}
+
+void handleSysexMessage(const uint8_t* data, uint8_t len) {
+  // Prefix: 0x7D 'F' 'S' 'W' <cmd>
+  if (len < 5) {
+    showTransferError();
+    return;
+  }
+  if (data[0] != 0x7D || data[1] != 'F' || data[2] != 'S' || data[3] != 'W') {
+    showTransferError();
+    return;
+  }
+
+  uint8_t cmd = data[4];
+
+  if (cmd == 0x10 && len >= 7) {
+    uint8_t ch = data[5];
+    uint8_t bri = data[6];
+
+    if (ch >= 1 && ch <= 16) {
+      globalMidiChannel = ch;
+    }
+    if (bri <= 10) {
+      pixelBrightness = (int)bri;
+      applyPixelBrightness();
+    }
+
+    markConfigDirty();
+    redrawDisplay();
+    return;
+  } else if (cmd == 0x10) {
+    showTransferError();
+    return;
+  }
+
+  // bank, switch, type, behavior, number, channel, on, off
+  if (cmd == 0x11 && len >= 13) {
+    uint8_t bank = data[5];
+    uint8_t swIdx = data[6];
+    uint8_t type = data[7];
+    uint8_t behavior = data[8];
+    uint8_t number = data[9];
+    uint8_t ch = data[10];
+    uint8_t onVal = data[11];
+    uint8_t offVal = data[12];
+
+    if (bank < 1 || bank > NUM_BANKS || swIdx < 1 || swIdx > numSwitches) {
+      showTransferError();
+      return;
+    }
+
+    SwitchConfig &sw = bankSwitches[bank - 1][swIdx - 1];
+
+    if (type <= (uint8_t)MIDI_TRANSPORT) {
+      sw.midiType = (MidiActionType)type;
+    } else {
+      showTransferError();
+      return;
+    }
+    if (behavior <= (uint8_t)BEHAVIOR_TOGGLE) {
+      sw.behavior = (SwitchBehavior)behavior;
+    } else {
+      showTransferError();
+      return;
+    }
+
+    if (sw.midiType == MIDI_TRANSPORT) {
+      sw.number = (uint8_t)(number % 4);
+    } else {
+      sw.number = (uint8_t)(number % 128);
+    }
+
+    sw.channel = (ch >= 1 && ch <= 16) ? ch : 1;
+    sw.onValue = (uint8_t)(onVal % 128);
+    sw.offValue = (uint8_t)(offVal % 128);
+
+    markConfigDirty();
+    redrawDisplay();
+    return;
+  } else if (cmd == 0x11) {
+    showTransferError();
+    return;
+  }
+
+  // Finalize and persist incoming edit session.
+  if (cmd == 0x12) {
+    saveConfigToEeprom();
+    transferMsgUntilMs = millis() + transferMsgDurationMs;
+    updateStatusPixels();
+    redrawDisplay();
+    return;
+  }
+
+  showTransferError();
 }
 
 // ============================================================
@@ -1063,6 +1224,18 @@ void redrawDisplay() {
       display.setCursor(0, 56);
       display.print("VEL/CC values per switch");
     }
+  }
+
+  if (millis() < transferErrMsgUntilMs) {
+    display.fillRect(0, 56, SCREEN_WIDTH, 8, SSD1306_WHITE);
+    display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+    display.setCursor(24, 56);
+    display.print("TRANSFER ERR");
+  } else if (millis() < transferMsgUntilMs) {
+    display.fillRect(0, 56, SCREEN_WIDTH, 8, SSD1306_WHITE);
+    display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+    display.setCursor(26, 56);
+    display.print("TRANSFER OK");
   }
 
   display.display();

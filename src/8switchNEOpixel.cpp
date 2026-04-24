@@ -164,6 +164,8 @@ Adafruit_NeoPixel pixels(TOTAL_PIXELS, PIXEL_PIN, NEO_GRB + NEO_KHZ800);
 bool lastPhysicalState[numSwitches];
 bool currentPhysicalState[numSwitches];
 bool toggleState[numSwitches];
+bool switchPressed[numSwitches];
+bool chordConsumed[numSwitches];
 
 unsigned long lastDebounceTime[numSwitches];
 const unsigned long debounceDelay = 20; // ms
@@ -459,6 +461,43 @@ void loop() {
 // ============================================================
 
 void handlePress(int index) {
+  switchPressed[index] = true;
+
+  // Chord detection: two leftmost (0+1) = bank down, two rightmost (6+7) = bank up
+  bool leftChord  = switchPressed[0] && switchPressed[1] && (index == 0 || index == 1);
+  bool rightChord = switchPressed[6] && switchPressed[7] && (index == 6 || index == 7);
+
+  if (leftChord || rightChord) {
+    int other = leftChord ? (index == 0 ? 1 : 0) : (index == 6 ? 7 : 6);
+
+    // Retroactively cancel the partner switch that fired first
+    if (!chordConsumed[other]) {
+      SwitchConfig &otherSw = activeSwitch(other);
+      if (otherSw.behavior == BEHAVIOR_MOMENTARY) {
+        sendMidiOff(otherSw);
+        setPixel(other, otherSw.offColor);
+      } else if (otherSw.behavior == BEHAVIOR_TOGGLE) {
+        // Undo the toggle
+        toggleState[other] = !toggleState[other];
+        if (toggleState[other]) {
+          sendMidiOn(otherSw);
+          setPixel(other, otherSw.onColor);
+        } else {
+          sendMidiOff(otherSw);
+          setPixel(other, otherSw.offColor);
+        }
+      }
+      chordConsumed[other] = true;
+    }
+    chordConsumed[index] = true;
+
+    int newBank = leftChord ? currentBank - 1 : currentBank + 1;
+    if (newBank < 1) newBank = NUM_BANKS;
+    if (newBank > NUM_BANKS) newBank = 1;
+    changeBank(newBank);
+    return;
+  }
+
   SwitchConfig &sw = activeSwitch(index);
 
   if (sw.behavior == BEHAVIOR_MOMENTARY) {
@@ -481,6 +520,13 @@ void handlePress(int index) {
 }
 
 void handleRelease(int index) {
+  switchPressed[index] = false;
+
+  if (chordConsumed[index]) {
+    chordConsumed[index] = false;
+    return;
+  }
+
   SwitchConfig &sw = activeSwitch(index);
 
   if (sw.behavior == BEHAVIOR_MOMENTARY) {

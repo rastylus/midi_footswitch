@@ -31,7 +31,7 @@ const int numSwitches = 8;
 
 #define EEPROM_SIZE_BYTES 512
 #define EEPROM_MAGIC 0x4D465357u
-#define EEPROM_VERSION 3u
+#define EEPROM_VERSION 4u
 
 // ---------- NeoPixel settings ----------
 #define PIXEL_PIN 10
@@ -52,7 +52,8 @@ const int numSwitches = 8;
 enum MidiActionType {
   MIDI_NOTE,
   MIDI_CC,
-  MIDI_PC
+  MIDI_PC,
+  MIDI_TRANSPORT
 };
 
 enum SwitchBehavior {
@@ -65,13 +66,23 @@ enum EditState {
   EDIT_VALUE
 };
 
+enum ScreenMode {
+  SCREEN_EDIT_PRIMARY,
+  SCREEN_EDIT_SECONDARY,
+  SCREEN_PERFORMANCE,
+  SCREEN_COUNT
+};
+
 enum EditField {
-  FIELD_BANK = 0,
+  FIELD_SCREEN = 0,
+  FIELD_BANK,
   FIELD_SWITCH,
   FIELD_SWITCH_CHANNEL,
   FIELD_BEHAVIOR,
   FIELD_TYPE,
   FIELD_NUMBER,
+  FIELD_ON_VALUE,
+  FIELD_OFF_VALUE,
   FIELD_BRIGHTNESS,
   FIELD_CHANNEL,
   FIELD_RESET,
@@ -130,6 +141,18 @@ struct PersistData {
   uint8_t channel[NUM_BANKS][numSwitches];
   uint8_t midiType[NUM_BANKS][numSwitches];
   uint8_t number[NUM_BANKS][numSwitches];
+  uint8_t onValue[NUM_BANKS][numSwitches];
+  uint8_t offValue[NUM_BANKS][numSwitches];
+};
+
+struct PersistDataV3 {
+  uint8_t globalChannel;
+  uint8_t pixelBrightness;
+  uint8_t reserved[2];
+  uint8_t behavior[NUM_BANKS][numSwitches];
+  uint8_t channel[NUM_BANKS][numSwitches];
+  uint8_t midiType[NUM_BANKS][numSwitches];
+  uint8_t number[NUM_BANKS][numSwitches];
 };
 
 // ============================================================
@@ -181,7 +204,8 @@ const unsigned long resetMsgDurationMs = 900;
 
 // Editor state
 EditState editState = EDIT_NAVIGATE;
-int selectedField = FIELD_BANK;
+ScreenMode currentScreen = SCREEN_EDIT_PRIMARY;
+int selectedField = FIELD_SCREEN;
 int globalMidiChannel = 1;
 int selectedSwitch = 0;
 int pixelBrightness = PIXEL_BRIGHTNESS_LEVEL;
@@ -195,7 +219,8 @@ bool configDirty = false;
 unsigned long lastConfigChangeMs = 0;
 const unsigned long configSaveDelayMs = 1500;
 
-const EditField navigationOrder[] = {
+const EditField primaryNavigationOrder[] = {
+  FIELD_SCREEN,
   FIELD_BANK,
   FIELD_CHANNEL,
   FIELD_RESET,
@@ -206,7 +231,23 @@ const EditField navigationOrder[] = {
   FIELD_NUMBER,
   FIELD_BRIGHTNESS
 };
-const int navigationFieldCount = sizeof(navigationOrder) / sizeof(navigationOrder[0]);
+const EditField secondaryNavigationOrder[] = {
+  FIELD_SCREEN,
+  FIELD_BANK,
+  FIELD_CHANNEL,
+  FIELD_RESET,
+  FIELD_SWITCH,
+  FIELD_SWITCH_CHANNEL,
+  FIELD_ON_VALUE,
+  FIELD_OFF_VALUE
+};
+const EditField performanceNavigationOrder[] = {
+  FIELD_SCREEN,
+  FIELD_BANK
+};
+const int primaryNavigationFieldCount = sizeof(primaryNavigationOrder) / sizeof(primaryNavigationOrder[0]);
+const int secondaryNavigationFieldCount = sizeof(secondaryNavigationOrder) / sizeof(secondaryNavigationOrder[0]);
+const int performanceNavigationFieldCount = sizeof(performanceNavigationOrder) / sizeof(performanceNavigationOrder[0]);
 
 // ============================================================
 // FORWARD DECLARATIONS (needed in .cpp, unlike .ino)
@@ -222,6 +263,8 @@ void sendNoteOnBoth(uint8_t note, uint8_t velocity, uint8_t channel);
 void sendNoteOffBoth(uint8_t note, uint8_t velocity, uint8_t channel);
 void sendCcBoth(uint8_t ccNumber, uint8_t value, uint8_t channel);
 void sendProgramChangeBoth(uint8_t programNumber, uint8_t channel);
+void sendSystemRealtimeBoth(uint8_t status);
+void sendTransportCommand(uint8_t commandIndex);
 void updateStatusPixels();
 void changeBank(int newBank);
 void encoderISR();
@@ -229,7 +272,10 @@ void redrawDisplay();
 void drawField(int16_t x, int16_t y, const char* label, int value, bool isSelected, bool isEditing);
 void drawFieldText(int16_t x, int16_t y, const char* label, const char* value, bool isSelected, bool isEditing);
 void adjustSelectedField(int delta);
+const char* screenModeName(ScreenMode mode);
+const EditField* currentNavigationOrder(int &count);
 const char* midiTypeName(MidiActionType type);
+const char* transportName(uint8_t commandIndex);
 const char* behaviorName(SwitchBehavior behavior);
 SwitchConfig& activeSwitch(int index);
 void buildCascadeBankPresets();
@@ -520,7 +566,18 @@ const char* midiTypeName(MidiActionType type) {
     case MIDI_NOTE: return "NOTE";
     case MIDI_CC:   return "CC";
     case MIDI_PC:   return "PC";
+    case MIDI_TRANSPORT: return "TRN";
     default:        return "?";
+  }
+}
+
+const char* transportName(uint8_t commandIndex) {
+  switch (commandIndex % 4) {
+    case 0: return "PLAY";
+    case 1: return "STOP";
+    case 2: return "CONT";
+    case 3: return "PANIC";
+    default: return "?";
   }
 }
 
@@ -529,6 +586,32 @@ const char* behaviorName(SwitchBehavior behavior) {
     case BEHAVIOR_MOMENTARY: return "MOMENTARY";
     case BEHAVIOR_TOGGLE:    return "TOGGLE";
     default:                 return "?";
+  }
+}
+
+const char* screenModeName(ScreenMode mode) {
+  switch (mode) {
+    case SCREEN_EDIT_PRIMARY:   return "E1";
+    case SCREEN_EDIT_SECONDARY: return "E2";
+    case SCREEN_PERFORMANCE:    return "PF";
+    default:                    return "?";
+  }
+}
+
+const EditField* currentNavigationOrder(int &count) {
+  switch (currentScreen) {
+    case SCREEN_EDIT_PRIMARY:
+      count = primaryNavigationFieldCount;
+      return primaryNavigationOrder;
+    case SCREEN_EDIT_SECONDARY:
+      count = secondaryNavigationFieldCount;
+      return secondaryNavigationOrder;
+    case SCREEN_PERFORMANCE:
+      count = performanceNavigationFieldCount;
+      return performanceNavigationOrder;
+    default:
+      count = primaryNavigationFieldCount;
+      return primaryNavigationOrder;
   }
 }
 
@@ -586,6 +669,16 @@ void buildCascadeBankPresets() {
       bankSwitches[bank][i].number = (uint8_t)shifted;
     }
   }
+
+  // Reserve the last bank as a transport bank:
+  // PLAY, STOP, CONT, PANIC, PANIC, CONT, STOP, PLAY.
+  int transportBank = NUM_BANKS - 1;
+  const uint8_t transportLayout[numSwitches] = {0, 1, 2, 3, 3, 2, 1, 0};
+  for (int i = 0; i < numSwitches; i++) {
+    bankSwitches[transportBank][i].midiType = MIDI_TRANSPORT;
+    bankSwitches[transportBank][i].behavior = BEHAVIOR_MOMENTARY;
+    bankSwitches[transportBank][i].number = transportLayout[i];
+  }
 }
 
 void applyCascadeFactoryReset() {
@@ -593,7 +686,8 @@ void applyCascadeFactoryReset() {
   globalMidiChannel = 1;
   currentBank = 1;
   selectedSwitch = 0;
-  selectedField = FIELD_BANK;
+  currentScreen = SCREEN_EDIT_PRIMARY;
+  selectedField = FIELD_SCREEN;
   editState = EDIT_NAVIGATE;
   lastPressedSwitch = -1;
   lastPressedIsOn = false;
@@ -638,6 +732,8 @@ void saveConfigToEeprom() {
       data.channel[bank][i] = bankSwitches[bank][i].channel;
       data.midiType[bank][i] = (uint8_t)bankSwitches[bank][i].midiType;
       data.number[bank][i] = bankSwitches[bank][i].number;
+      data.onValue[bank][i] = bankSwitches[bank][i].onValue;
+      data.offValue[bank][i] = bankSwitches[bank][i].offValue;
     }
   }
 
@@ -656,53 +752,96 @@ void saveConfigToEeprom() {
 
 bool loadConfigFromEeprom() {
   PersistHeader header;
-  PersistData data;
 
   EEPROM.get(0, header);
   if (header.magic != EEPROM_MAGIC ||
-      header.version != EEPROM_VERSION ||
       header.banks != NUM_BANKS ||
       header.switches != numSwitches) {
     return false;
   }
 
-  EEPROM.get((int)sizeof(header), data);
-  uint32_t checksum = calcChecksum((const uint8_t*)&data, sizeof(data));
-  if (checksum != header.checksum) {
-    return false;
-  }
-
-  if (data.globalChannel >= 1 && data.globalChannel <= 16) {
-    globalMidiChannel = data.globalChannel;
-  }
-  if (data.pixelBrightness <= 255) {
-    pixelBrightness = brightnessLevelFromStored(data.pixelBrightness);
-  }
-
-  for (int bank = 0; bank < NUM_BANKS; bank++) {
-    for (int i = 0; i < numSwitches; i++) {
-      uint8_t bh = data.behavior[bank][i];
-      if (bh <= (uint8_t)BEHAVIOR_TOGGLE) {
-        bankSwitches[bank][i].behavior = (SwitchBehavior)bh;
-      }
-
-      uint8_t ch = data.channel[bank][i];
-      if (ch >= 1 && ch <= 16) {
-        bankSwitches[bank][i].channel = ch;
-      }
-
-      uint8_t mt = data.midiType[bank][i];
-      if (mt <= (uint8_t)MIDI_PC) {
-        bankSwitches[bank][i].midiType = (MidiActionType)mt;
-      }
-      bankSwitches[bank][i].number = data.number[bank][i];
+  if (header.version == EEPROM_VERSION) {
+    PersistData data;
+    EEPROM.get((int)sizeof(header), data);
+    uint32_t checksum = calcChecksum((const uint8_t*)&data, sizeof(data));
+    if (checksum != header.checksum) {
+      return false;
     }
+
+    if (data.globalChannel >= 1 && data.globalChannel <= 16) {
+      globalMidiChannel = data.globalChannel;
+    }
+    pixelBrightness = brightnessLevelFromStored(data.pixelBrightness);
+
+    for (int bank = 0; bank < NUM_BANKS; bank++) {
+      for (int i = 0; i < numSwitches; i++) {
+        uint8_t bh = data.behavior[bank][i];
+        if (bh <= (uint8_t)BEHAVIOR_TOGGLE) {
+          bankSwitches[bank][i].behavior = (SwitchBehavior)bh;
+        }
+
+        uint8_t ch = data.channel[bank][i];
+        if (ch >= 1 && ch <= 16) {
+          bankSwitches[bank][i].channel = ch;
+        }
+
+        uint8_t mt = data.midiType[bank][i];
+        if (mt <= (uint8_t)MIDI_TRANSPORT) {
+          bankSwitches[bank][i].midiType = (MidiActionType)mt;
+        }
+
+        bankSwitches[bank][i].number = data.number[bank][i];
+        bankSwitches[bank][i].onValue = data.onValue[bank][i];
+        bankSwitches[bank][i].offValue = data.offValue[bank][i];
+      }
+    }
+
+    return true;
   }
 
-  return true;
+  if (header.version == 3u) {
+    PersistDataV3 data;
+    EEPROM.get((int)sizeof(header), data);
+    uint32_t checksum = calcChecksum((const uint8_t*)&data, sizeof(data));
+    if (checksum != header.checksum) {
+      return false;
+    }
+
+    if (data.globalChannel >= 1 && data.globalChannel <= 16) {
+      globalMidiChannel = data.globalChannel;
+    }
+    pixelBrightness = brightnessLevelFromStored(data.pixelBrightness);
+
+    for (int bank = 0; bank < NUM_BANKS; bank++) {
+      for (int i = 0; i < numSwitches; i++) {
+        uint8_t bh = data.behavior[bank][i];
+        if (bh <= (uint8_t)BEHAVIOR_TOGGLE) {
+          bankSwitches[bank][i].behavior = (SwitchBehavior)bh;
+        }
+
+        uint8_t ch = data.channel[bank][i];
+        if (ch >= 1 && ch <= 16) {
+          bankSwitches[bank][i].channel = ch;
+        }
+
+        uint8_t mt = data.midiType[bank][i];
+        if (mt <= (uint8_t)MIDI_TRANSPORT) {
+          bankSwitches[bank][i].midiType = (MidiActionType)mt;
+        }
+
+        bankSwitches[bank][i].number = data.number[bank][i];
+      }
+    }
+
+    return true;
+  }
+
+  return false;
 }
 
 EditField stepNavigationField(EditField current, int step) {
+  int navigationFieldCount = 0;
+  const EditField *navigationOrder = currentNavigationOrder(navigationFieldCount);
   int idx = 0;
   for (int i = 0; i < navigationFieldCount; i++) {
     if (navigationOrder[i] == current) {
@@ -721,59 +860,122 @@ void redrawDisplay() {
   if (!hasDisplay) return;
 
   display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
-
   bool editing = (editState == EDIT_VALUE);
   SwitchConfig &selectedSw = activeSwitch(selectedSwitch);
 
-  // Top line: bank + global channel
-  drawField(0, 0, "BANK:", currentBank, selectedField == FIELD_BANK, editing);
-  drawField(56, 0, "GCH:", globalMidiChannel, selectedField == FIELD_CHANNEL, editing);
-  drawFieldText(112, 0, "", "*", selectedField == FIELD_RESET, editing);
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
 
-  // Second line: selected switch + per-switch channel + behavior
-  drawField(0, 16, "SW:", selectedSwitch + 1, selectedField == FIELD_SWITCH, editing);
-  drawField(30, 16, "SCH:", selectedSw.channel, selectedField == FIELD_SWITCH_CHANNEL, editing);
-  drawFieldText(72, 16, "", behaviorName(selectedSw.behavior), selectedField == FIELD_BEHAVIOR, editing);
+  drawFieldText(0, 0, "", screenModeName(currentScreen), selectedField == FIELD_SCREEN, editing);
+  drawField(36, 0, "BANK:", currentBank, selectedField == FIELD_BANK, editing);
 
-  // Third line: TYPE left of NUM
-  drawFieldText(0, 32, "TYPE:", midiTypeName(selectedSw.midiType), selectedField == FIELD_TYPE, editing);
-  drawField(72, 32, "NUM:", selectedSw.number, selectedField == FIELD_NUMBER, editing);
+  if (currentScreen != SCREEN_PERFORMANCE) {
+    drawField(74, 0, "GCH:", globalMidiChannel, selectedField == FIELD_CHANNEL, editing);
+    drawFieldText(122, 0, "", "*", selectedField == FIELD_RESET, editing);
+  }
 
-  // Bottom line: reset message or last pressed state
-  if (millis() < resetMsgUntilMs) {
-    display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
-    display.setCursor(0, resetTextY);
-    display.print("* CASCADE RESET");
-  } else if (resetHoldActive && !resetHoldTriggered && encSwStableState == LOW) {
-    display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
-    display.setCursor(0, resetTextY);
-    display.print("RESET LAYOUT");
-    display.drawRect(holdBarX, holdBarY, holdBarW, holdBarH, SSD1306_WHITE);
-    if (resetHoldProgressPx > 0) {
-      display.fillRect(holdBarX + 1, holdBarY + 1, resetHoldProgressPx, holdBarH - 2, SSD1306_WHITE);
+  if (currentScreen == SCREEN_EDIT_PRIMARY) {
+    drawField(0, 16, "SW:", selectedSwitch + 1, selectedField == FIELD_SWITCH, editing);
+    drawField(30, 16, "SCH:", selectedSw.channel, selectedField == FIELD_SWITCH_CHANNEL, editing);
+    drawFieldText(72, 16, "", behaviorName(selectedSw.behavior), selectedField == FIELD_BEHAVIOR, editing);
+
+    drawFieldText(0, 32, "TYPE:", midiTypeName(selectedSw.midiType), selectedField == FIELD_TYPE, editing);
+    if (selectedSw.midiType == MIDI_TRANSPORT) {
+      drawFieldText(72, 32, "CMD:", transportName(selectedSw.number), selectedField == FIELD_NUMBER, editing);
+    } else {
+      drawField(72, 32, "NUM:", selectedSw.number, selectedField == FIELD_NUMBER, editing);
+    }
+  } else if (currentScreen == SCREEN_EDIT_SECONDARY) {
+    drawField(0, 16, "SW:", selectedSwitch + 1, selectedField == FIELD_SWITCH, editing);
+    drawField(30, 16, "SCH:", selectedSw.channel, selectedField == FIELD_SWITCH_CHANNEL, editing);
+
+    drawField(0, 32, "ON:", selectedSw.onValue, selectedField == FIELD_ON_VALUE, editing);
+    drawField(54, 32, "OFF:", selectedSw.offValue, selectedField == FIELD_OFF_VALUE, editing);
+
+    display.setCursor(0, 48);
+    display.print("TYPE:");
+    display.print(midiTypeName(selectedSw.midiType));
+    if (selectedSw.midiType == MIDI_TRANSPORT) {
+      display.print(" CMD:");
+      display.print(transportName(selectedSw.number));
+    } else {
+      display.print("  NUM:");
+      display.print(selectedSw.number);
     }
   } else {
-    display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
-    display.setCursor(0, 56);
-    if (lastPressedSwitch >= 0) {
-      display.print("LAST SW");
-      display.print(lastPressedSwitch + 1);
-      display.print(" ");
-      display.print(lastPressedIsOn ? "ON" : "OFF");
-    } else {
-      display.print("LAST: NONE");
-    }
+    int shownSwitch = (lastPressedSwitch >= 0) ? (lastPressedSwitch + 1) : (selectedSwitch + 1);
+    int shownNumber = (lastPressedSwitch >= 0) ? activeSwitch(lastPressedSwitch).number : selectedSw.number;
+    MidiActionType shownType = (lastPressedSwitch >= 0) ? activeSwitch(lastPressedSwitch).midiType : selectedSw.midiType;
 
-    drawField(84, 56, "BRI:", pixelBrightness, selectedField == FIELD_BRIGHTNESS, editing);
+    display.setTextSize(1);
+    display.setCursor(0, 16);
+    display.print("LIVE VIEW");
+    display.setCursor(72, 16);
+    display.print(lastPressedIsOn ? "ON" : "OFF");
+
+    display.setTextSize(2);
+    display.setCursor(0, 28);
+    display.print("SW");
+    display.print(shownSwitch);
+
+    display.setCursor(64, 28);
+    display.print(midiTypeName(shownType));
+
+    display.setCursor(0, 48);
+    if (shownType == MIDI_TRANSPORT) {
+      display.print("CMD ");
+      display.print(transportName((uint8_t)shownNumber));
+    } else {
+      display.print("NUM ");
+      display.print(shownNumber);
+    }
+  }
+
+  if (currentScreen != SCREEN_PERFORMANCE) {
+    if (millis() < resetMsgUntilMs) {
+      display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
+      display.setCursor(0, resetTextY);
+      display.print("* CASCADE RESET");
+    } else if (resetHoldActive && !resetHoldTriggered && encSwStableState == LOW) {
+      display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
+      display.setCursor(0, resetTextY);
+      display.print("RESET LAYOUT");
+      display.drawRect(holdBarX, holdBarY, holdBarW, holdBarH, SSD1306_WHITE);
+      if (resetHoldProgressPx > 0) {
+        display.fillRect(holdBarX + 1, holdBarY + 1, resetHoldProgressPx, holdBarH - 2, SSD1306_WHITE);
+      }
+    } else if (currentScreen == SCREEN_EDIT_PRIMARY) {
+      display.setCursor(0, 56);
+      if (lastPressedSwitch >= 0) {
+        display.print("LAST SW");
+        display.print(lastPressedSwitch + 1);
+        display.print(" ");
+        display.print(lastPressedIsOn ? "ON" : "OFF");
+      } else {
+        display.print("LAST: NONE");
+      }
+
+      drawField(84, 56, "BRI:", pixelBrightness, selectedField == FIELD_BRIGHTNESS, editing);
+    } else {
+      display.setCursor(0, 56);
+      display.print("VEL/CC values per switch");
+    }
   }
 
   display.display();
 }
 
 void adjustSelectedField(int delta) {
-  if (selectedField == FIELD_BANK) {
+  if (selectedField == FIELD_SCREEN) {
+    int nextScreen = (int)currentScreen + delta;
+    if (nextScreen < 0) nextScreen = (int)SCREEN_COUNT - 1;
+    if (nextScreen >= (int)SCREEN_COUNT) nextScreen = 0;
+    currentScreen = (ScreenMode)nextScreen;
+    if (selectedField == FIELD_RESET && currentScreen == SCREEN_PERFORMANCE) {
+      selectedField = FIELD_SCREEN;
+    }
+    redrawDisplay();
+  } else if (selectedField == FIELD_BANK) {
     int newBank = currentBank + delta;
     if (newBank < 1) newBank = NUM_BANKS;
     if (newBank > NUM_BANKS) newBank = 1;
@@ -799,17 +1001,38 @@ void adjustSelectedField(int delta) {
   } else if (selectedField == FIELD_TYPE) {
     SwitchConfig &sw = activeSwitch(selectedSwitch);
     int type = (int)sw.midiType + delta;
-    if (type < (int)MIDI_NOTE) type = (int)MIDI_PC;
-    if (type > (int)MIDI_PC) type = (int)MIDI_NOTE;
+    if (type < (int)MIDI_NOTE) type = (int)MIDI_TRANSPORT;
+    if (type > (int)MIDI_TRANSPORT) type = (int)MIDI_NOTE;
     sw.midiType = (MidiActionType)type;
     markConfigDirty();
     redrawDisplay();
   } else if (selectedField == FIELD_NUMBER) {
     SwitchConfig &sw = activeSwitch(selectedSwitch);
     int number = (int)sw.number + delta;
-    if (number < 0) number = 127;
-    if (number > 127) number = 0;
+    if (sw.midiType == MIDI_TRANSPORT) {
+      if (number < 0) number = 3;
+      if (number > 3) number = 0;
+    } else {
+      if (number < 0) number = 127;
+      if (number > 127) number = 0;
+    }
     sw.number = (uint8_t)number;
+    markConfigDirty();
+    redrawDisplay();
+  } else if (selectedField == FIELD_ON_VALUE) {
+    SwitchConfig &sw = activeSwitch(selectedSwitch);
+    int value = (int)sw.onValue + delta;
+    if (value < 0) value = 127;
+    if (value > 127) value = 0;
+    sw.onValue = (uint8_t)value;
+    markConfigDirty();
+    redrawDisplay();
+  } else if (selectedField == FIELD_OFF_VALUE) {
+    SwitchConfig &sw = activeSwitch(selectedSwitch);
+    int value = (int)sw.offValue + delta;
+    if (value < 0) value = 127;
+    if (value > 127) value = 0;
+    sw.offValue = (uint8_t)value;
     markConfigDirty();
     redrawDisplay();
   } else if (selectedField == FIELD_BRIGHTNESS) {
@@ -872,6 +1095,10 @@ void sendMidiOn(const SwitchConfig &sw) {
     case MIDI_PC:
       sendProgramChangeBoth(sw.number, globalMidiChannel);
       break;
+
+    case MIDI_TRANSPORT:
+      sendTransportCommand(sw.number);
+      break;
   }
 }
 
@@ -887,6 +1114,10 @@ void sendMidiOff(const SwitchConfig &sw) {
 
     case MIDI_PC:
       // Usually no "off" for program change
+      break;
+
+    case MIDI_TRANSPORT:
+      // Transport commands are sent on press only.
       break;
   }
 }
@@ -952,4 +1183,36 @@ void sendProgramChangeBoth(uint8_t programNumber, uint8_t channel) {
 
   Serial1.write((uint8_t)(0xC0 | ((channel - 1) & 0x0F)));
   Serial1.write(programNumber);
+}
+
+void sendSystemRealtimeBoth(uint8_t status) {
+  midiEventPacket_t packet = {
+    0x0F,
+    status,
+    0x00,
+    0x00
+  };
+  MidiUSB.sendMIDI(packet);
+  MidiUSB.flush();
+
+  Serial1.write(status);
+}
+
+void sendTransportCommand(uint8_t commandIndex) {
+  switch (commandIndex % 4) {
+    case 0: // START
+      sendSystemRealtimeBoth(0xFA);
+      break;
+    case 1: // STOP
+      sendSystemRealtimeBoth(0xFC);
+      break;
+    case 2: // CONTINUE
+      sendSystemRealtimeBoth(0xFB);
+      break;
+    case 3: // PANIC (all notes off on all channels)
+      for (uint8_t ch = 1; ch <= 16; ch++) {
+        sendCcBoth(123, 0, ch);
+      }
+      break;
+  }
 }

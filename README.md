@@ -24,6 +24,30 @@ Peripherals currently used:
 - SSD1306 OLED at I2C address 0x3C
 - DIN MIDI out on Serial1 @ 31250 baud
 
+## Current Pinout (Adafruit Labels)
+
+KB2040 silk labels are shown with the active firmware assignment.
+
+- `GP2`  -> `SW_1`
+- `GP3`  -> `SW_2`
+- `GP4`  -> `SW_3`
+- `GP5`  -> `SW_4`
+- `GP6`  -> `SW_5`
+- `GP7`  -> `SW_6`
+- `GP8`  -> `SW_7`
+- `GP9`  -> `SW_8`
+- `GP10` -> NeoPixel data (10-pixel chain)
+- `GP19` -> Encoder CLK (`ENC_CLK`)
+- `GP20` -> Encoder DT (`ENC_DT`)
+- `GP18` -> Encoder push switch (`ENC_SW`)
+- `GP12` / `SDA` -> OLED SDA
+- `GP13` / `SCL` -> OLED SCL
+
+Notes:
+- Switches are configured as `INPUT_PULLUP` (pressed = `LOW`).
+- NeoPixel status indices are currently `8` (power) and `9` (bank).
+- USB MIDI is over the native USB port; DIN MIDI uses `Serial1` in firmware.
+
 ## Software Stack
 
 - PlatformIO

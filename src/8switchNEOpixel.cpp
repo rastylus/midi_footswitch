@@ -1329,7 +1329,18 @@ void adjustSelectedField(int delta) {
 
 void changeBank(int newBank) {
   if (newBank == currentBank) return;
+
   currentBank = newBank;
+
+  // Bank switches should always come up visually/latch-wise clean on bank change.
+  for (int i = 0; i < numSwitches; i++) {
+    toggleState[i] = false;
+    const SwitchConfig &sw = activeSwitch(i);
+    setPixel(i, sw.offColor);
+  }
+  lastPressedSwitch = -1;
+  lastPressedIsOn = false;
+
   updateStatusPixels();
   redrawDisplay();
 }

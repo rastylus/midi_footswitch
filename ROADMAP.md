@@ -7,15 +7,20 @@
 - [x] OLED display updates for switch actions
 - [x] NeoPixel switch indicators
 - [x] Single-chain status LEDs (power + bank)
+- [x] Encoder-driven settings UI (bank, type, number, channel, behavior)
+- [x] Bank switching with multi-bank mappings
+- [x] EEPROM settings memory with restore on boot
+- [x] Cascade bank preset layout + reset action
+- [x] Adjustable NeoPixel brightness from UI
 - [x] Git repository initialized and pushed
 
 ## Near-Term
 
 ### 1) Bank Switching
-- [ ] Implement bank up/down actions
-- [ ] Define bank-switch controls (dedicated switches or combos)
-- [ ] Persist current bank in RAM runtime state
-- [ ] Update OLED and bank status LED on bank change
+- [x] Implement bank up/down actions
+- [x] Define bank-switch controls (encoder UI)
+- [x] Persist current bank in RAM runtime state
+- [x] Update OLED and bank status LED on bank change
 
 ### 2) Config Organization
 - [ ] Move switch config data to dedicated module/header
@@ -25,12 +30,12 @@
 ### 3) UX Improvements
 - [ ] Add startup splash with firmware version
 - [ ] Add brief MIDI send feedback on OLED
-- [ ] Add configurable LED brightness for stage use
+- [x] Add configurable LED brightness for stage use
 
 ## Mid-Term
 
 ### 4) Persistence
-- [ ] Save user settings in non-volatile storage (LittleFS/EEPROM emulation)
+- [x] Save user settings in non-volatile storage (EEPROM emulation)
 - [ ] Restore last-used bank on boot
 
 ### 5) MIDI Features

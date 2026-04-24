@@ -31,13 +31,13 @@ const int numSwitches = 8;
 
 #define EEPROM_SIZE_BYTES 512
 #define EEPROM_MAGIC 0x4D465357u
-#define EEPROM_VERSION 2u
+#define EEPROM_VERSION 3u
 
 // ---------- NeoPixel settings ----------
 #define PIXEL_PIN 10
 #define NUM_SWITCH_PIXELS 8
 #define TOTAL_PIXELS 10
-#define PIXEL_BRIGHTNESS 40
+#define PIXEL_BRIGHTNESS_LEVEL 5
 
 // ---------- Status NeoPixel indexes on same chain ----------
 // If status LEDs are physically first in chain, set these to 0 and 1.
@@ -72,6 +72,7 @@ enum EditField {
   FIELD_BEHAVIOR,
   FIELD_TYPE,
   FIELD_NUMBER,
+  FIELD_BRIGHTNESS,
   FIELD_CHANNEL,
   FIELD_RESET,
   FIELD_COUNT
@@ -123,7 +124,8 @@ struct PersistHeader {
 
 struct PersistData {
   uint8_t globalChannel;
-  uint8_t reserved[3];
+  uint8_t pixelBrightness;
+  uint8_t reserved[2];
   uint8_t behavior[NUM_BANKS][numSwitches];
   uint8_t channel[NUM_BANKS][numSwitches];
   uint8_t midiType[NUM_BANKS][numSwitches];
@@ -182,6 +184,7 @@ EditState editState = EDIT_NAVIGATE;
 int selectedField = FIELD_BANK;
 int globalMidiChannel = 1;
 int selectedSwitch = 0;
+int pixelBrightness = PIXEL_BRIGHTNESS_LEVEL;
 
 // Last pressed switch (for display)
 int lastPressedSwitch = -1;
@@ -200,7 +203,8 @@ const EditField navigationOrder[] = {
   FIELD_SWITCH_CHANNEL,
   FIELD_BEHAVIOR,
   FIELD_TYPE,
-  FIELD_NUMBER
+  FIELD_NUMBER,
+  FIELD_BRIGHTNESS
 };
 const int navigationFieldCount = sizeof(navigationOrder) / sizeof(navigationOrder[0]);
 
@@ -230,6 +234,9 @@ const char* behaviorName(SwitchBehavior behavior);
 SwitchConfig& activeSwitch(int index);
 void buildCascadeBankPresets();
 void applyCascadeFactoryReset();
+uint8_t brightnessValueFromLevel(int level);
+int brightnessLevelFromStored(uint8_t storedValue);
+void applyPixelBrightness();
 uint32_t calcChecksum(const uint8_t* data, size_t len);
 void markConfigDirty();
 void saveConfigToEeprom();
@@ -272,7 +279,7 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(ENC_CLK), encoderISR, CHANGE);
 
   pixels.begin();
-  pixels.setBrightness(PIXEL_BRIGHTNESS);
+  applyPixelBrightness();
   pixels.clear();
   pixels.show();
   updateStatusPixels();
@@ -529,6 +536,42 @@ SwitchConfig& activeSwitch(int index) {
   return bankSwitches[currentBank - 1][index];
 }
 
+uint8_t brightnessValueFromLevel(int level) {
+  static const uint8_t brightnessTable[11] = {0, 4, 8, 14, 24, 40, 64, 96, 136, 184, 255};
+
+  if (level < 0) {
+    level = 0;
+  }
+  if (level > 10) {
+    level = 10;
+  }
+
+  return brightnessTable[level];
+}
+
+int brightnessLevelFromStored(uint8_t storedValue) {
+  if (storedValue <= 10) {
+    return storedValue;
+  }
+
+  int bestLevel = 0;
+  int bestDiff = 255;
+  for (int level = 0; level <= 10; level++) {
+    int diff = abs((int)brightnessValueFromLevel(level) - (int)storedValue);
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      bestLevel = level;
+    }
+  }
+
+  return bestLevel;
+}
+
+void applyPixelBrightness() {
+  pixels.setBrightness(brightnessValueFromLevel(pixelBrightness));
+  updateStatusPixels();
+}
+
 void buildCascadeBankPresets() {
   // Each bank starts from defaults, then cascades MIDI numbers by 8 per bank.
   for (int bank = 0; bank < NUM_BANKS; bank++) {
@@ -585,9 +628,9 @@ void saveConfigToEeprom() {
   PersistData data;
 
   data.globalChannel = (uint8_t)globalMidiChannel;
+  data.pixelBrightness = (uint8_t)pixelBrightness;
   data.reserved[0] = 0;
   data.reserved[1] = 0;
-  data.reserved[2] = 0;
 
   for (int bank = 0; bank < NUM_BANKS; bank++) {
     for (int i = 0; i < numSwitches; i++) {
@@ -631,6 +674,9 @@ bool loadConfigFromEeprom() {
 
   if (data.globalChannel >= 1 && data.globalChannel <= 16) {
     globalMidiChannel = data.globalChannel;
+  }
+  if (data.pixelBrightness <= 255) {
+    pixelBrightness = brightnessLevelFromStored(data.pixelBrightness);
   }
 
   for (int bank = 0; bank < NUM_BANKS; bank++) {
@@ -719,6 +765,8 @@ void redrawDisplay() {
     } else {
       display.print("LAST: NONE");
     }
+
+    drawField(84, 56, "BRI:", pixelBrightness, selectedField == FIELD_BRIGHTNESS, editing);
   }
 
   display.display();
@@ -762,6 +810,13 @@ void adjustSelectedField(int delta) {
     if (number < 0) number = 127;
     if (number > 127) number = 0;
     sw.number = (uint8_t)number;
+    markConfigDirty();
+    redrawDisplay();
+  } else if (selectedField == FIELD_BRIGHTNESS) {
+    pixelBrightness += delta;
+    if (pixelBrightness < 0) pixelBrightness = 10;
+    if (pixelBrightness > 10) pixelBrightness = 0;
+    applyPixelBrightness();
     markConfigDirty();
     redrawDisplay();
   } else if (selectedField == FIELD_CHANNEL) {

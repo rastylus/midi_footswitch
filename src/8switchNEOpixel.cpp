@@ -24,9 +24,9 @@ const int numSwitches = 8;
 #define SW_8 9
 
 // ---------- Rotary encoder ----------
-#define ENC_CLK 19
-#define ENC_DT  20
-#define ENC_SW  18
+#define ENC_CLK 27
+#define ENC_DT  28
+#define ENC_SW  29
 #define NUM_BANKS 8
 
 #define EEPROM_SIZE_BYTES 512

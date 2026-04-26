@@ -1352,10 +1352,10 @@ void redrawDisplay() {
 
     if (compact) {
       display.setTextSize(1);
-      display.setCursor(0, 14);
+      display.setCursor(0, 17);
       display.print("LIVE B");
       display.print(currentBank);
-      display.setCursor(54, 14);
+      display.setCursor(54, 17);
       display.print(lastPressedIsOn ? "ON" : "OFF");
 
       display.setTextSize(2);

@@ -3,7 +3,7 @@
 #include <Adafruit_NeoPixel.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
+#include "display/DisplayBackend.h"
 #include <MIDIUSB.h>
 #include <EEPROM.h>
 
@@ -170,10 +170,8 @@ bool chordConsumed[numSwitches];
 unsigned long lastDebounceTime[numSwitches];
 const unsigned long debounceDelay = 20; // ms
 
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
-
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+const int SCREEN_WIDTH = DISPLAY_SCREEN_WIDTH;
+const int SCREEN_HEIGHT = DISPLAY_SCREEN_HEIGHT;
 
 int currentBank = 1;
 bool hasDisplay = false;
@@ -207,6 +205,9 @@ unsigned long transferMsgUntilMs = 0;
 const unsigned long transferMsgDurationMs = 1200;
 unsigned long transferErrMsgUntilMs = 0;
 const unsigned long transferErrMsgDurationMs = 1400;
+unsigned long lastDisplayFrameMs = 0;
+bool redrawPending = false;
+const unsigned long minDisplayFrameIntervalMs = 20;
 
 const uint8_t FW_VERSION_MAJOR = 0;
 const uint8_t FW_VERSION_MINOR = 4;
@@ -288,8 +289,9 @@ void updateStatusPixels();
 void changeBank(int newBank);
 void encoderISR();
 void redrawDisplay();
-void drawField(int16_t x, int16_t y, const char* label, int value, bool isSelected, bool isEditing);
-void drawFieldText(int16_t x, int16_t y, const char* label, const char* value, bool isSelected, bool isEditing);
+void serviceDisplayRefresh();
+void drawField(int16_t x, int16_t y, const char* label, int value, bool isSelected, bool isEditing, uint16_t baseColor = SSD1306_WHITE);
+void drawFieldText(int16_t x, int16_t y, const char* label, const char* value, bool isSelected, bool isEditing, uint16_t baseColor = SSD1306_WHITE);
 void adjustSelectedField(int delta);
 const char* screenModeName(ScreenMode mode);
 const EditField* currentNavigationOrder(int &count);
@@ -355,14 +357,14 @@ void setup() {
   Serial1.begin(31250);
   delay(1000);
 
-  hasDisplay = display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  hasDisplay = beginDisplay();
   if (hasDisplay) {
-    display.clearDisplay();
+    clearDisplayFrame();
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
     display.setCursor(0, 0);
     display.println("FOOTSWITCH READY");
-    display.display();
+    presentDisplayFrame();
     delay(1000);
     redrawDisplay();
   }
@@ -475,6 +477,8 @@ void loop() {
       }
     }
   }
+
+  serviceDisplayRefresh();
 }
 
 void processIncomingUsbMidi() {
@@ -789,7 +793,7 @@ void encoderISR() {
   }
 }
 
-void drawField(int16_t x, int16_t y, const char* label, int value, bool isSelected, bool isEditing) {
+void drawField(int16_t x, int16_t y, const char* label, int value, bool isSelected, bool isEditing, uint16_t baseColor) {
   char buf[20];
   snprintf(buf, sizeof(buf), "%s%d", label, value);
 
@@ -799,16 +803,16 @@ void drawField(int16_t x, int16_t y, const char* label, int value, bool isSelect
     display.print(buf);
     display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
   } else {
-    display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
+    display.setTextColor(baseColor, SSD1306_BLACK);
     display.setCursor(x, y);
     display.print(buf);
     if (isSelected) {
-      display.drawFastHLine(x, y + 7, (int16_t)(strlen(buf) * 6), SSD1306_WHITE);
+      display.drawFastHLine(x, y + 7, (int16_t)(strlen(buf) * 6), baseColor);
     }
   }
 }
 
-void drawFieldText(int16_t x, int16_t y, const char* label, const char* value, bool isSelected, bool isEditing) {
+void drawFieldText(int16_t x, int16_t y, const char* label, const char* value, bool isSelected, bool isEditing, uint16_t baseColor) {
   char buf[24];
   snprintf(buf, sizeof(buf), "%s%s", label, value);
 
@@ -818,11 +822,11 @@ void drawFieldText(int16_t x, int16_t y, const char* label, const char* value, b
     display.print(buf);
     display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
   } else {
-    display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
+    display.setTextColor(baseColor, SSD1306_BLACK);
     display.setCursor(x, y);
     display.print(buf);
     if (isSelected) {
-      display.drawFastHLine(x, y + 7, (int16_t)(strlen(buf) * 6), SSD1306_WHITE);
+      display.drawFastHLine(x, y + 7, (int16_t)(strlen(buf) * 6), baseColor);
     }
   }
 }
@@ -864,6 +868,68 @@ const char* behaviorName(SwitchBehavior behavior) {
     case BEHAVIOR_TOGGLE:    return "TOGGLE";
     default:                 return "?";
   }
+}
+
+const char* behaviorShortName(SwitchBehavior behavior) {
+  switch (behavior) {
+    case BEHAVIOR_MOMENTARY: return "MOM";
+    case BEHAVIOR_TOGGLE:    return "TGL";
+    default:                 return "?";
+  }
+}
+
+const char* transportShortName(uint8_t commandIndex) {
+  switch (commandIndex % 4) {
+    case 0: return "PLY";
+    case 1: return "STP";
+    case 2: return "CON";
+    case 3: return "PAN";
+    default: return "?";
+  }
+}
+
+uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
+  return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+}
+
+bool useCompactDisplayLayout() {
+#if defined(DISPLAY_HAS_SSD1331)
+  return true;
+#else
+  return SCREEN_WIDTH <= 96;
+#endif
+}
+
+uint16_t uiBankColor(int bank) {
+  switch (bank) {
+    case 1: return rgb565(0, 220, 0);
+    case 2: return rgb565(220, 220, 0);
+    case 3: return rgb565(0, 120, 255);
+    case 4: return rgb565(220, 0, 220);
+    case 5: return rgb565(0, 220, 220);
+    case 6: return rgb565(255, 120, 0);
+    case 7: return rgb565(255, 255, 255);
+    case 8: return rgb565(255, 0, 0);
+    default: return SSD1306_WHITE;
+  }
+}
+
+uint16_t uiTypeColor(MidiActionType type) {
+  switch (type) {
+    case MIDI_NOTE:      return rgb565(0, 220, 0);
+    case MIDI_CC:        return rgb565(0, 120, 255);
+    case MIDI_PC:        return rgb565(255, 170, 0);
+    case MIDI_TRANSPORT: return rgb565(220, 0, 220);
+    default:             return SSD1306_WHITE;
+  }
+}
+
+uint16_t uiSuccessColor() {
+  return rgb565(0, 180, 0);
+}
+
+uint16_t uiErrorColor() {
+  return rgb565(220, 0, 0);
 }
 
 RgbColor typeOnColor(MidiActionType type) {
@@ -1165,107 +1231,218 @@ EditField stepNavigationField(EditField current, int step) {
 void redrawDisplay() {
   if (!hasDisplay) return;
 
-  display.clearDisplay();
+  unsigned long now = millis();
+  if ((now - lastDisplayFrameMs) < minDisplayFrameIntervalMs) {
+    redrawPending = true;
+    return;
+  }
+  redrawPending = false;
+
+  clearDisplayFrame();
+  const bool compact = useCompactDisplayLayout();
   bool editing = (editState == EDIT_VALUE);
   SwitchConfig &selectedSw = activeSwitch(selectedSwitch);
 
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
 
-  drawFieldText(0, 0, "", screenModeName(currentScreen), selectedField == FIELD_SCREEN, editing);
-  drawField(36, 0, "BANK:", currentBank, selectedField == FIELD_BANK, editing);
+  if (compact) {
+    drawFieldText(0, 0, "", screenModeName(currentScreen), selectedField == FIELD_SCREEN, editing);
+    drawField(24, 0, "B:", currentBank, selectedField == FIELD_BANK, editing, uiBankColor(currentBank));
+  } else {
+    drawFieldText(0, 0, "", screenModeName(currentScreen), selectedField == FIELD_SCREEN, editing);
+    drawField(36, 0, "BANK:", currentBank, selectedField == FIELD_BANK, editing, uiBankColor(currentBank));
+  }
 
   if (currentScreen != SCREEN_PERFORMANCE) {
-    drawField(74, 0, "GCH:", globalMidiChannel, selectedField == FIELD_CHANNEL, editing);
-    drawFieldText(122, 0, "", "*", selectedField == FIELD_RESET, editing);
+    if (compact) {
+      drawField(48, 0, "CH:", globalMidiChannel, selectedField == FIELD_CHANNEL, editing);
+      drawFieldText(84, 0, "", "*", selectedField == FIELD_RESET, editing, rgb565(255, 220, 0));
+    } else {
+      drawField(74, 0, "GCH:", globalMidiChannel, selectedField == FIELD_CHANNEL, editing);
+      drawFieldText(122, 0, "", "*", selectedField == FIELD_RESET, editing, rgb565(255, 220, 0));
+    }
   }
 
   if (currentScreen == SCREEN_EDIT_PRIMARY) {
-    drawField(0, 16, "SW:", selectedSwitch + 1, selectedField == FIELD_SWITCH, editing);
-    drawField(30, 16, "SCH:", selectedSw.channel, selectedField == FIELD_SWITCH_CHANNEL, editing);
-    drawFieldText(72, 16, "", behaviorName(selectedSw.behavior), selectedField == FIELD_BEHAVIOR, editing);
+    if (compact) {
+      drawField(0, 16, "S:", selectedSwitch + 1, selectedField == FIELD_SWITCH, editing);
+      drawField(20, 16, "C:", selectedSw.channel, selectedField == FIELD_SWITCH_CHANNEL, editing);
+      drawFieldText(44, 16, "", behaviorShortName(selectedSw.behavior), selectedField == FIELD_BEHAVIOR, editing);
 
-    drawFieldText(0, 32, "TYPE:", midiTypeName(selectedSw.midiType), selectedField == FIELD_TYPE, editing);
-    if (selectedSw.midiType == MIDI_TRANSPORT) {
-      drawFieldText(72, 32, "CMD:", transportName(selectedSw.number), selectedField == FIELD_NUMBER, editing);
-    } else {
-      drawField(72, 32, "NUM:", selectedSw.number, selectedField == FIELD_NUMBER, editing);
-    }
+      drawFieldText(0, 28, "", midiTypeName(selectedSw.midiType), selectedField == FIELD_TYPE, editing, uiTypeColor(selectedSw.midiType));
+      if (selectedSw.midiType == MIDI_TRANSPORT) {
+        drawFieldText(42, 28, "", transportShortName(selectedSw.number), selectedField == FIELD_NUMBER, editing, uiTypeColor(selectedSw.midiType));
+      } else {
+        drawField(42, 28, "", selectedSw.number, selectedField == FIELD_NUMBER, editing, uiTypeColor(selectedSw.midiType));
+      }
 
-    if (selectedSw.midiType == MIDI_NOTE) {
-      display.setCursor(0, 48);
-      display.print("NOTE:");
-      display.print(noteName(selectedSw.number));
-    }
-  } else if (currentScreen == SCREEN_EDIT_SECONDARY) {
-    drawField(0, 16, "SW:", selectedSwitch + 1, selectedField == FIELD_SWITCH, editing);
-    drawField(30, 16, "SCH:", selectedSw.channel, selectedField == FIELD_SWITCH_CHANNEL, editing);
-
-    drawField(0, 32, "ON:", selectedSw.onValue, selectedField == FIELD_ON_VALUE, editing);
-    drawField(54, 32, "OFF:", selectedSw.offValue, selectedField == FIELD_OFF_VALUE, editing);
-
-    display.setCursor(0, 48);
-    display.print("TYPE:");
-    display.print(midiTypeName(selectedSw.midiType));
-    if (selectedSw.midiType == MIDI_TRANSPORT) {
-      display.print(" CMD:");
-      display.print(transportName(selectedSw.number));
-    } else {
-      display.print("  NUM:");
-      display.print(selectedSw.number);
       if (selectedSw.midiType == MIDI_NOTE) {
-        display.print(" ");
+        display.setCursor(0, 42);
+        display.print("Nt:");
         display.print(noteName(selectedSw.number));
       }
+
+      drawField(48, 42, "Br:", pixelBrightness, selectedField == FIELD_BRIGHTNESS, editing);
+    } else {
+      drawField(0, 16, "SW:", selectedSwitch + 1, selectedField == FIELD_SWITCH, editing);
+      drawField(30, 16, "SCH:", selectedSw.channel, selectedField == FIELD_SWITCH_CHANNEL, editing);
+      drawFieldText(72, 16, "", behaviorName(selectedSw.behavior), selectedField == FIELD_BEHAVIOR, editing);
+
+      drawFieldText(0, 32, "TYPE:", midiTypeName(selectedSw.midiType), selectedField == FIELD_TYPE, editing, uiTypeColor(selectedSw.midiType));
+      if (selectedSw.midiType == MIDI_TRANSPORT) {
+        drawFieldText(72, 32, "CMD:", transportName(selectedSw.number), selectedField == FIELD_NUMBER, editing, uiTypeColor(selectedSw.midiType));
+      } else {
+        drawField(72, 32, "NUM:", selectedSw.number, selectedField == FIELD_NUMBER, editing, uiTypeColor(selectedSw.midiType));
+      }
+
+      if (selectedSw.midiType == MIDI_NOTE) {
+        display.setCursor(0, 48);
+        display.print("NOTE:");
+        display.print(noteName(selectedSw.number));
+      }
+    }
+  } else if (currentScreen == SCREEN_EDIT_SECONDARY) {
+    if (compact) {
+      drawField(0, 16, "S:", selectedSwitch + 1, selectedField == FIELD_SWITCH, editing);
+      drawField(20, 16, "C:", selectedSw.channel, selectedField == FIELD_SWITCH_CHANNEL, editing);
+
+      drawField(0, 28, "On:", selectedSw.onValue, selectedField == FIELD_ON_VALUE, editing);
+      drawField(42, 28, "Off:", selectedSw.offValue, selectedField == FIELD_OFF_VALUE, editing);
+
+      display.setCursor(0, 42);
+      display.setTextColor(uiTypeColor(selectedSw.midiType), SSD1306_BLACK);
+      display.print(midiTypeName(selectedSw.midiType));
+      if (selectedSw.midiType == MIDI_TRANSPORT) {
+        display.print(" ");
+        display.print(transportShortName(selectedSw.number));
+      } else {
+        display.print(" ");
+        display.print(selectedSw.number);
+      }
+      display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
+    } else {
+      drawField(0, 16, "SW:", selectedSwitch + 1, selectedField == FIELD_SWITCH, editing);
+      drawField(30, 16, "SCH:", selectedSw.channel, selectedField == FIELD_SWITCH_CHANNEL, editing);
+
+      drawField(0, 32, "ON:", selectedSw.onValue, selectedField == FIELD_ON_VALUE, editing);
+      drawField(54, 32, "OFF:", selectedSw.offValue, selectedField == FIELD_OFF_VALUE, editing);
+
+      display.setCursor(0, 48);
+      display.setTextColor(uiTypeColor(selectedSw.midiType), SSD1306_BLACK);
+      display.print("TYPE:");
+      display.print(midiTypeName(selectedSw.midiType));
+      if (selectedSw.midiType == MIDI_TRANSPORT) {
+        display.print(" CMD:");
+        display.print(transportName(selectedSw.number));
+      } else {
+        display.print("  NUM:");
+        display.print(selectedSw.number);
+        if (selectedSw.midiType == MIDI_NOTE) {
+          display.print(" ");
+          display.print(noteName(selectedSw.number));
+        }
+      }
+      display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
     }
   } else {
     int shownSwitch = (lastPressedSwitch >= 0) ? (lastPressedSwitch + 1) : (selectedSwitch + 1);
     int shownNumber = (lastPressedSwitch >= 0) ? activeSwitch(lastPressedSwitch).number : selectedSw.number;
     MidiActionType shownType = (lastPressedSwitch >= 0) ? activeSwitch(lastPressedSwitch).midiType : selectedSw.midiType;
 
-    display.setTextSize(1);
-    display.setCursor(0, 16);
-    display.print("LIVE VIEW");
-    display.setCursor(72, 16);
-    display.print(lastPressedIsOn ? "ON" : "OFF");
+    if (compact) {
+      display.setTextSize(1);
+      display.setCursor(0, 17);
+      display.print("LIVE B");
+      display.print(currentBank);
+      display.setCursor(54, 17);
+      display.print(lastPressedIsOn ? "ON" : "OFF");
 
-    display.setTextSize(2);
-    display.setCursor(0, 28);
-    display.print("SW");
-    display.print(shownSwitch);
+      display.setTextSize(2);
+      display.setCursor(0, 30);
+      display.print("SW");
+      display.print(shownSwitch);
 
-    display.setCursor(64, 28);
-    display.print(midiTypeName(shownType));
+      display.setTextColor(uiTypeColor(shownType), SSD1306_BLACK);
+      display.setCursor(48, 30);
+      display.print(midiTypeName(shownType));
+      display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
 
-    display.setCursor(0, 48);
-    if (shownType == MIDI_TRANSPORT) {
-      display.print("CMD ");
-      display.print(transportName((uint8_t)shownNumber));
+      display.setTextSize(1);
+      display.setCursor(0, 48);
+      if (shownType == MIDI_TRANSPORT) {
+        display.print("C ");
+        display.print(transportShortName((uint8_t)shownNumber));
+      } else {
+        display.print("N ");
+        display.setTextSize(2);
+        int numberX = 12;
+        display.setCursor(numberX, 46);
+        display.print(shownNumber);
+        display.setTextSize(1);
+        if (shownType == MIDI_NOTE) {
+          int digits = (shownNumber >= 100) ? 3 : (shownNumber >= 10 ? 2 : 1);
+          int noteX = numberX + (digits * 12) + 2;
+          display.setCursor(noteX, 48);
+          display.print(" ");
+          display.print(noteName((uint8_t)shownNumber));
+        }
+      }
     } else {
-      display.print("NUM ");
-      display.print(shownNumber);
-      if (shownType == MIDI_NOTE) {
-        display.print(" ");
-        display.print(noteName((uint8_t)shownNumber));
+      display.setTextSize(1);
+      display.setCursor(0, 16);
+      display.print("LIVE VIEW");
+      display.setCursor(72, 16);
+      display.print(lastPressedIsOn ? "ON" : "OFF");
+
+      display.setTextSize(2);
+      display.setCursor(0, 28);
+      display.print("SW");
+      display.print(shownSwitch);
+
+      display.setTextColor(uiTypeColor(shownType), SSD1306_BLACK);
+      display.setCursor(64, 28);
+      display.print(midiTypeName(shownType));
+      display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
+
+      display.setCursor(0, 48);
+      if (shownType == MIDI_TRANSPORT) {
+        display.print("CMD ");
+        display.print(transportName((uint8_t)shownNumber));
+      } else {
+        display.print("NUM ");
+        display.print(shownNumber);
+        if (shownType == MIDI_NOTE) {
+          display.print(" ");
+          display.print(noteName((uint8_t)shownNumber));
+        }
       }
     }
   }
 
   if (currentScreen != SCREEN_PERFORMANCE) {
+    int barX = compact ? 4 : holdBarX;
+    int barY = compact ? (SCREEN_HEIGHT - 10) : holdBarY;
+    int barW = compact ? (SCREEN_WIDTH - 8) : holdBarW;
+    int barH = compact ? 6 : holdBarH;
+    int resetY = compact ? (SCREEN_HEIGHT - 18) : resetTextY;
+
     if (millis() < resetMsgUntilMs) {
       display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
-      display.setCursor(0, resetTextY);
+      display.setCursor(0, resetY);
       display.print("* CASCADE RESET");
     } else if (resetHoldActive && !resetHoldTriggered && encSwStableState == LOW) {
       display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
-      display.setCursor(0, resetTextY);
+      display.setCursor(0, resetY);
       display.print("RESET LAYOUT");
-      display.drawRect(holdBarX, holdBarY, holdBarW, holdBarH, SSD1306_WHITE);
+      display.drawRect(barX, barY, barW, barH, SSD1306_WHITE);
       if (resetHoldProgressPx > 0) {
-        display.fillRect(holdBarX + 1, holdBarY + 1, resetHoldProgressPx, holdBarH - 2, SSD1306_WHITE);
+        int innerW = barW - 2;
+        int scaledPx = (int)((long)resetHoldProgressPx * innerW / (holdBarW - 2));
+        display.fillRect(barX + 1, barY + 1, scaledPx, barH - 2, SSD1306_WHITE);
       }
     } else if (currentScreen == SCREEN_EDIT_PRIMARY) {
-      display.setCursor(0, 56);
+      display.setCursor(0, SCREEN_HEIGHT - 8);
       if (lastPressedSwitch >= 0) {
         display.print("LAST SW");
         display.print(lastPressedSwitch + 1);
@@ -1275,26 +1452,44 @@ void redrawDisplay() {
         display.print("LAST: NONE");
       }
 
-      drawField(84, 56, "BRI:", pixelBrightness, selectedField == FIELD_BRIGHTNESS, editing);
+      if (!compact) {
+        drawField(84, 56, "BRI:", pixelBrightness, selectedField == FIELD_BRIGHTNESS, editing);
+      }
     } else {
-      display.setCursor(0, 56);
-      display.print("VEL/CC values per switch");
+      display.setCursor(0, SCREEN_HEIGHT - 8);
+      display.print(compact ? "ON/OFF per switch" : "VEL/CC values per switch");
     }
   }
 
   if (millis() < transferErrMsgUntilMs) {
-    display.fillRect(0, 56, SCREEN_WIDTH, 8, SSD1306_WHITE);
-    display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
-    display.setCursor(24, 56);
+    uint16_t bg = uiErrorColor();
+    uint16_t fg = SSD1306_WHITE;
+    display.fillRect(0, SCREEN_HEIGHT - 8, SCREEN_WIDTH, 8, bg);
+    display.setTextColor(fg, bg);
+    display.setCursor(compact ? 16 : 24, SCREEN_HEIGHT - 8);
     display.print("TRANSFER ERR");
   } else if (millis() < transferMsgUntilMs) {
-    display.fillRect(0, 56, SCREEN_WIDTH, 8, SSD1306_WHITE);
-    display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
-    display.setCursor(26, 56);
+    uint16_t bg = uiSuccessColor();
+    uint16_t fg = SSD1306_BLACK;
+    display.fillRect(0, SCREEN_HEIGHT - 8, SCREEN_WIDTH, 8, bg);
+    display.setTextColor(fg, bg);
+    display.setCursor(compact ? 18 : 26, SCREEN_HEIGHT - 8);
     display.print("TRANSFER OK");
   }
 
-  display.display();
+  presentDisplayFrame();
+  lastDisplayFrameMs = millis();
+}
+
+void serviceDisplayRefresh() {
+  if (!redrawPending) {
+    return;
+  }
+
+  unsigned long now = millis();
+  if ((now - lastDisplayFrameMs) >= minDisplayFrameIntervalMs) {
+    redrawDisplay();
+  }
 }
 
 void adjustSelectedField(int delta) {

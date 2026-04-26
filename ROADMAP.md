@@ -15,6 +15,9 @@
 - [x] Transport command type (PLAY/STOP/CONT/PANIC) + dedicated transport bank
 - [x] Ableton-first factory-reset default mapping profile
 - [x] Adjustable NeoPixel brightness from UI
+- [x] Dual OLED backend support (SSD1306 mono + SSD1331 color)
+- [x] Mirror display mode (SSD1306 + SSD1331 at the same time)
+- [x] SSD1331 brightness tuning via build flags
 - [x] Git repository initialized and pushed
 
 ## Near-Term
@@ -35,6 +38,7 @@
 - [ ] Add startup splash with firmware version
 - [ ] Add brief MIDI send feedback on OLED
 - [x] Add configurable LED brightness for stage use
+- [x] Improve color OLED update smoothness (offscreen buffer blit)
 
 ## Mid-Term
 
